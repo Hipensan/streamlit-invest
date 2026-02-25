@@ -2,14 +2,73 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import requests
+import streamlit as st
 from io import StringIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 from datetime import datetime
 import argparse
-import os
 
 warnings.filterwarnings("ignore")
+
+@st.cache_data(ttl=60 * 10, show_spinner=False)
+def _cached_sp500_tickers():
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(url, headers=headers)
+    df = pd.read_html(StringIO(response.text))[0]
+    tickers = df['Symbol'].tolist()
+    return [t.replace('.', '-') for t in tickers]
+
+@st.cache_data(ttl=60 * 10, show_spinner=False)
+def _cached_spy_prices(start_date):
+    spy = yf.download("SPY", start=start_date, progress=False, auto_adjust=True)
+    if spy.index.tz is not None:
+        spy.index = spy.index.tz_localize(None)
+    
+    if isinstance(spy['Close'], pd.DataFrame):
+        close_series = spy['Close'].iloc[:, 0]
+    else:
+        close_series = spy['Close']
+        
+    spy_df = pd.DataFrame(index=spy.index)
+    spy_df['Close'] = close_series
+    return spy_df
+
+@st.cache_data(ttl=60 * 10, show_spinner=False)
+def _cached_price_data(tickers, start_date):
+    prices = {}
+
+    def fetch(ticker):
+        try:
+            t = yf.Ticker(ticker)
+            df = t.history(start=start_date, auto_adjust=True)
+            if df.empty:
+                df = yf.download(ticker, start=start_date, progress=False, auto_adjust=True)
+            if not df.empty and 'Close' in df.columns:
+                c = df['Close']
+                if isinstance(c, pd.DataFrame):
+                    return ticker, c.iloc[:, 0]
+                return ticker, c
+        except:
+            return ticker, None
+        return ticker, None
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        futures = {executor.submit(fetch, t): t for t in tickers}
+        for future in as_completed(futures):
+            ticker, series = future.result()
+            if series is not None:
+                if series.index.tz is not None:
+                    series.index = series.index.tz_localize(None)
+                prices[ticker] = series
+    
+    if not prices:
+        return pd.DataFrame()
+
+    price_df = pd.concat(prices, axis=1)
+    price_df.sort_index(inplace=True)
+    return price_df
 
 class MomentumStrategy:
     def __init__(self, top_n=5, momentum_window=6, lookback_years=10):
@@ -19,136 +78,147 @@ class MomentumStrategy:
 
     @staticmethod
     def get_sp500_tickers():
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
         try:
-            headers = {"User-Agent": "Mozilla/5.0"}
-            response = requests.get(url, headers=headers)
-            df = pd.read_html(StringIO(response.text))[0]
-            tickers = df['Symbol'].tolist()
-            return [t.replace('.', '-') for t in tickers]
+            return _cached_sp500_tickers()
         except Exception as e:
-            print(f"티커 리스트 다운로드 실패: {e}")
+            print(f"??? ??????????? ???: {e}")
             return []
 
     def get_price_data(self, tickers, start_date=None):
         if start_date is None:
             start_date = (datetime.now() - pd.DateOffset(years=self.lookback_years + 2)).strftime('%Y-%m-%d')
-        
-        prices = {}
-        def fetch(ticker):
-            try:
-                t = yf.Ticker(ticker)
-                df = t.history(start=start_date, auto_adjust=True)
-                if df.empty:
-                    df = yf.download(ticker, start=start_date, progress=False, auto_adjust=True)
-                if not df.empty and 'Close' in df.columns:
-                    c = df['Close']
-                    if isinstance(c, pd.DataFrame):
-                        return ticker, c.iloc[:, 0]
-                    return ticker, c
-            except:
-                return ticker, None
-            return ticker, None
-
-        with ThreadPoolExecutor(max_workers=16) as executor:
-            futures = {executor.submit(fetch, t): t for t in tickers}
-            for future in as_completed(futures):
-                ticker, series = future.result()
-                if series is not None:
-                    if series.index.tz is not None:
-                        series.index = series.index.tz_localize(None)
-                    prices[ticker] = series
-        
-        if not prices:
-            return pd.DataFrame()
-
-        price_df = pd.concat(prices, axis=1)
-        price_df.sort_index(inplace=True)
-        return price_df
+        return _cached_price_data(tuple(tickers), start_date)
 
     @staticmethod
-    def get_spy_filter(start_date):
-        spy = yf.download("SPY", start=start_date, progress=False, auto_adjust=True)
-        if spy.index.tz is not None:
-            spy.index = spy.index.tz_localize(None)
-        
-        if isinstance(spy['Close'], pd.DataFrame):
-            close_series = spy['Close'].iloc[:, 0]
-        else:
-            close_series = spy['Close']
-            
-        spy_df = pd.DataFrame(index=spy.index)
-        spy_df['Close'] = close_series
-        spy_df['SMA200'] = close_series.rolling(window=200).mean()
-        return spy_df
+    def get_spy_prices(start_date):
+        return _cached_spy_prices(start_date)
 
-    def run_simulation(self, interval='1mo'):
+    def run_simulation(self, interval='1mo', strategy_name="Momentum"):
         tickers = self.get_sp500_tickers()
         if not tickers: return None, None
         price_df = self.get_price_data(tickers)
         if price_df.empty: return None, None
-        spy_df = self.get_spy_filter(price_df.index[0])
+        spy_df = self.get_spy_prices(price_df.index[0])
 
         if interval == '2wk':
             resample_rule, periods_per_year = '2W-FRI', 26
-            window = int(self.momentum_window * 26 / 12)
         elif interval == '1wk':
             resample_rule, periods_per_year = 'W-FRI', 52
-            window = int(self.momentum_window * 52 / 12)
         else:
             resample_rule, periods_per_year = 'M', 12
-            window = self.momentum_window
 
-        monthly_prices = price_df.resample(resample_rule).last()
-        momentum_df = monthly_prices.pct_change(window)
-        
+        rebalance_prices = price_df.resample(resample_rule).last()
+        # Drop the last resampled row if it is labeled after the last actual trading date
+        # (e.g., month-end label when the month is not finished yet).
+        last_actual_date = price_df.index[-1]
+        if not rebalance_prices.empty and rebalance_prices.index[-1] > last_actual_date:
+            rebalance_prices = rebalance_prices.iloc[:-1]
+        # Use daily momentum (same logic as recommendation) for consistency
+        lookback_days = int(self.momentum_window * 21)
+
         portfolio_value = 10000.0
         history = []
-        start_idx = window
-        
-        for i in range(start_idx, len(monthly_prices) - 1):
-            current_date = monthly_prices.index[i]
-            next_date = monthly_prices.index[i+1]
-            
-            # 리밸런싱: 현재 자산을 현금화했다고 가정하고 다시 분배
-            # (실제로는 매도/매수 수수료가 발생하지만 여기서는 무시하거나 필요시 추가 가능)
+        start_idx = 1
+        buy_hold_shares = None
+        buy_hold_cash = None
+        spy_close = spy_df['Close'] if isinstance(spy_df, pd.DataFrame) and 'Close' in spy_df.columns else None
+
+        def price_on_or_before(df, date, ticker):
+            series = df[ticker].loc[:date].dropna()
+            if series.empty:
+                return np.nan
+            return series.iloc[-1]
+
+        def series_on_or_before(series, date):
+            s = series.loc[:date].dropna()
+            if s.empty:
+                return np.nan
+            return s.iloc[-1]
+
+        def compute_scores(current_prices):
+            if strategy_name == "Momentum":
+                scores = current_prices.pct_change(lookback_days).iloc[-1].dropna()
+            elif strategy_name == "Blended Momentum (3/6/12)":
+                lookbacks = [63, 126, 252]
+                parts = []
+                for lb in lookbacks:
+                    if len(current_prices) > lb:
+                        parts.append(current_prices.pct_change(lb).iloc[-1])
+                if not parts:
+                    return pd.Series(dtype=float)
+                scores = pd.concat(parts, axis=1).mean(axis=1).dropna()
+            elif strategy_name == "Volatility-Adjusted Momentum":
+                if len(current_prices) <= lookback_days:
+                    return pd.Series(dtype=float)
+                mom = current_prices.pct_change(lookback_days).iloc[-1]
+                daily_returns = current_prices.pct_change().tail(lookback_days)
+                vol = daily_returns.std()
+                scores = (mom / vol.replace(0, np.nan)).dropna()
+            else:
+                scores = current_prices.pct_change(lookback_days).iloc[-1].dropna()
+            return scores
+
+        for i in range(start_idx, len(rebalance_prices) - 1):
+            current_date = rebalance_prices.index[i]
+            next_date = rebalance_prices.index[i+1]
+
             current_cash = portfolio_value
             target_allocation = current_cash / self.top_n
 
-            current_momentum = momentum_df.iloc[i]
-            top_series = current_momentum.sort_values(ascending=False).head(self.top_n)
+            current_prices = price_df.loc[:current_date]
+            if len(current_prices) <= lookback_days:
+                continue
+
+            if strategy_name == "Buy & Hold SPY":
+                if spy_close is None or spy_close.empty:
+                    continue
+                if buy_hold_shares is None:
+                    current_price = series_on_or_before(spy_close, current_date)
+                    if pd.isna(current_price) or current_price <= 0:
+                        continue
+                    buy_hold_shares = int(current_cash / current_price)
+                    buy_hold_cash = current_cash - (buy_hold_shares * current_price)
+                next_price = series_on_or_before(spy_close, next_date)
+                if pd.isna(next_price) or next_price <= 0:
+                    next_price = series_on_or_before(spy_close, current_date)
+                portfolio_value = buy_hold_cash + (buy_hold_shares * next_price)
+                holdings_display = f"Cash(${buy_hold_cash:.0f}) + SPY({buy_hold_shares})"
+                history.append({
+                    "Date": next_date,
+                    "Value": portfolio_value,
+                    "Return": (portfolio_value - current_cash) / current_cash * 100,
+                    "Holdings": holdings_display
+                })
+                continue
+
+            score_series = compute_scores(current_prices)
+            if score_series.empty:
+                continue
+            top_series = score_series.sort_values(ascending=False).head(self.top_n)
             top_stocks = top_series.index.tolist()
-            
-            held_stocks = [] # (ticker, shares, buy_price)
+
+            held_stocks = []  # (ticker, shares, buy_price)
             invested_amount = 0
-            stock_details = []
 
             for ticker in top_stocks:
-                current_price = monthly_prices.loc[current_date, ticker]
-                
-                # 가격 데이터 유효성 검사
+                current_price = price_on_or_before(price_df, current_date, ticker)
+
                 if pd.isna(current_price) or current_price <= 0:
                     continue
 
-                # 정수 단위 주식 수 계산 (Floor)
                 shares = int(target_allocation / current_price)
                 cost = shares * current_price
-                
-                # 기본 정보 저장 (0주여도 리스트에는 일단 포함, 재투자에서 추가될 수 있음)
-                # 재투자 편의를 위해 일단 0주인 종목도 후보군에 둡니다.
+
                 held_stocks.append({
-                    'ticker': ticker, 
-                    'shares': shares, 
+                    'ticker': ticker,
+                    'shares': shares,
                     'price': current_price,
                     'cost': cost
                 })
                 invested_amount += cost
-            
-            # 남은 현금 (자투리 돈)
+
             leftover_cash = current_cash - invested_amount
 
-            # 2차: 자투리 현금 재투자 (모멘텀 순위대로 1주씩 추가 매수 시도)
-            # held_stocks는 이미 모멘텀 순으로 정렬되어 있음 (top_stocks 순서)
             while True:
                 bought_something = False
                 for item in held_stocks:
@@ -157,33 +227,24 @@ class MomentumStrategy:
                         item['shares'] += 1
                         item['cost'] += item['price']
                         bought_something = True
-                        # 한 바퀴 돌 때마다 가장 높은 순위부터 다시 기회를 주려면 break 할 수도 있으나,
-                        # 여기서는 순서대로 골고루(Round Robin) 분배하는 것이 일반적임.
-                        # 다만 "모멘텀 강한 놈에게 몰아주기"를 원한다면 break 후 다시 처음부터 시작해야 함.
-                        # "강한 놈 더 사기" 전략 채택:
-                        # break 
-                
-                # Round Robin 방식 (순서대로 1주씩)으로 계속 돌면서 살 수 있는 거 다 사기
                 if not bought_something:
                     break
-            
-            # 최종 포트폴리오 구성
+
             next_portfolio_value = leftover_cash
             stock_details = []
-            
+
             for item in held_stocks:
                 if item['shares'] > 0:
-                    m_score = top_series[item['ticker']] * 100
-                    stock_details.append(f"{item['ticker']}({item['shares']}주)")
-                    
-                    next_price = monthly_prices.loc[next_date, item['ticker']]
+                    stock_details.append(f"{item['ticker']}({item['shares']} 개)")
+
+                    next_price = price_on_or_before(price_df, next_date, item['ticker'])
                     if pd.isna(next_price) or next_price <= 0:
-                        next_price = monthly_prices.loc[current_date, item['ticker']]
-                    
+                        next_price = price_on_or_before(price_df, current_date, item['ticker'])
+
                     next_portfolio_value += item['shares'] * next_price
 
             portfolio_value = next_portfolio_value
-            holdings_display = f"현금(${leftover_cash:.0f}) + " + ", ".join(stock_details)
+            holdings_display = f"Cash(${leftover_cash:.0f}) + " + ", ".join(stock_details)
 
             history.append({
                 "Date": next_date,
@@ -215,14 +276,12 @@ class MomentumStrategy:
     def recommend_portfolio(self, my_stocks=None, investment_capital=10000):
         end_date = datetime.now()
         start_date_spy = end_date - pd.DateOffset(days=400)
-        spy_df = self.get_spy_filter(start_date_spy)
+        spy_df = self.get_spy_prices(start_date_spy)
         
         current_price = float(spy_df['Close'].iloc[-1])
-        current_sma = float(spy_df['SMA200'].iloc[-1])
 
         recommendation = {
             "SPY Price": current_price,
-            "SPY SMA200": current_sma,
             "Date": spy_df.index[-1].date(),
             "SPY Data": spy_df.tail(252)
         }
@@ -233,7 +292,29 @@ class MomentumStrategy:
         
         lookback_days = int(self.momentum_window * 21)
         momentum = price_df.pct_change(lookback_days).iloc[-1].dropna()
-        top_stocks = momentum.sort_values(ascending=False).head(self.top_n)
+        momentum_sorted = momentum.sort_values(ascending=False)
+        top_stocks = momentum_sorted.head(self.top_n)
+        alternate_stocks = momentum_sorted.head(self.top_n + 3).iloc[self.top_n:]
+
+        def _stock_metrics(series):
+            metrics = {
+                "Return 3M": np.nan,
+                "Return 6M": np.nan,
+                "Return 12M": np.nan,
+                "Volatility (63d)": np.nan
+            }
+            if series is None or series.empty:
+                return metrics
+            if len(series) > 63:
+                metrics["Return 3M"] = series.pct_change(63).iloc[-1] * 100
+            if len(series) > 126:
+                metrics["Return 6M"] = series.pct_change(126).iloc[-1] * 100
+            if len(series) > 252:
+                metrics["Return 12M"] = series.pct_change(252).iloc[-1] * 100
+            daily_returns = series.pct_change().tail(63)
+            if daily_returns.dropna().size > 2:
+                metrics["Volatility (63d)"] = daily_returns.std() * np.sqrt(252) * 100
+            return metrics
         
         target_allocation = investment_capital / self.top_n
         
@@ -242,31 +323,53 @@ class MomentumStrategy:
         invested_cost = 0
 
         for ticker, mom in top_stocks.items():
-            # 마지막 가격이 NaN일 수 있으므로 유효한 마지막 값을 가져옴
             series = price_df[ticker].dropna()
             if series.empty:
                 continue
             price = series.iloc[-1]
-            
-            # 가격이 0 이하이거나 NaN이면 건너뜀 (안전장치)
+
             if pd.isna(price) or price <= 0:
                 continue
 
             shares = int(target_allocation / price)
             cost = shares * price
             invested_cost += cost
-            
+
+            metrics = _stock_metrics(series)
             rec_stocks.append({
                 "Ticker": ticker,
                 "Momentum": mom * 100,
                 "Price": price,
                 "Shares to Buy": shares,
-                "Cost": cost
+                "Cost": cost,
+                "Return 3M": metrics["Return 3M"],
+                "Return 6M": metrics["Return 6M"],
+                "Return 12M": metrics["Return 12M"],
+                "Volatility (63d)": metrics["Volatility (63d)"]
             })
             
         # 2차 분배: 남은 현금 재투자 (모멘텀 순위 우선)
         leftover_cash = investment_capital - invested_cost
-        
+
+        alternates = []
+        for ticker, mom in alternate_stocks.items():
+            series = price_df[ticker].dropna()
+            if series.empty:
+                continue
+            price = series.iloc[-1]
+            if pd.isna(price) or price <= 0:
+                continue
+            metrics = _stock_metrics(series)
+            alternates.append({
+                "Ticker": ticker,
+                "Momentum": mom * 100,
+                "Price": price,
+                "Return 3M": metrics["Return 3M"],
+                "Return 6M": metrics["Return 6M"],
+                "Return 12M": metrics["Return 12M"],
+                "Volatility (63d)": metrics["Volatility (63d)"]
+            })
+
         while True:
             bought_something = False
             for item in rec_stocks:
@@ -280,11 +383,14 @@ class MomentumStrategy:
                 break
         
         recommendation["Top Stocks"] = rec_stocks
+        recommendation["Alternates"] = alternates
+        top_tickers_list = top_stocks.index.tolist()
+        top_prices = price_df[top_tickers_list].dropna(how='all').tail(252)
+        recommendation["Top Prices"] = top_prices
         recommendation["Total Cost"] = sum(x['Cost'] for x in rec_stocks)
         recommendation["Leftover Cash"] = leftover_cash
         
         if my_stocks:
-            top_tickers_list = top_stocks.index.tolist()
             recommendation["Analysis"] = {
                 "Keep": [t for t in my_stocks if t in top_tickers_list],
                 "Sell": [t for t in my_stocks if t not in top_tickers_list],
@@ -294,20 +400,9 @@ class MomentumStrategy:
         return recommendation
 
 
-def load_portfolio(filepath):
-    if not os.path.exists(filepath):
-        pd.DataFrame(columns=["Ticker", "Date", "Price"]).to_csv(filepath, index=False)
-        return []
-    try:
-        df = pd.read_csv(filepath)
-        return df['Ticker'].astype(str).str.upper().str.strip().tolist()
-    except:
-        return []
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Dual Momentum Strategy")
     parser.add_argument("--backtest", action="store_true", help="백테스트 시뮬레이션 실행")
-    parser.add_argument("--portfolio", type=str, default="my_portfolio.csv", help="포트폴리오 파일 경로")
     parser.add_argument("--interval", type=str, default="1mo", choices=["1mo", "2wk", "1wk"], help="리밸런싱 주기")
     args = parser.parse_args()
 
@@ -318,7 +413,6 @@ if __name__ == "__main__":
             print(f"CAGR: {summary['CAGR']:.2f}%, MDD: {summary['MDD']:.2f}%")
             results.to_csv("Momentum_Strategy_Result.csv", index=False)
     else:
-        my_stocks = load_portfolio(args.portfolio)
-        rec = strategy.recommend_portfolio(my_stocks)
+        rec = strategy.recommend_portfolio(None)
         print(rec)
 
