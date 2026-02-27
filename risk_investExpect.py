@@ -93,7 +93,7 @@ class MomentumStrategy:
     def get_spy_prices(start_date):
         return _cached_spy_prices(start_date)
 
-    def run_simulation(self, interval='1mo', strategy_name="Momentum"):
+    def run_simulation(self, interval='1mo', strategy_name="Momentum", buy_lag_days=1):
         tickers = self.get_sp500_tickers()
         if not tickers: return None, None
         price_df = self.get_price_data(tickers)
@@ -135,6 +135,13 @@ class MomentumStrategy:
                 return np.nan
             return s.iloc[-1]
 
+        def trading_date_on_or_before(index, date, lag_days=0):
+            candidates = index[index <= date]
+            if len(candidates) == 0:
+                return None
+            pos = max(0, len(candidates) - 1 - lag_days)
+            return candidates[pos]
+
         def compute_scores(current_prices):
             if strategy_name == "Momentum":
                 scores = current_prices.pct_change(lookback_days).iloc[-1].dropna()
@@ -161,11 +168,15 @@ class MomentumStrategy:
         for i in range(start_idx, len(rebalance_prices) - 1):
             current_date = rebalance_prices.index[i]
             next_date = rebalance_prices.index[i+1]
+            buy_date = trading_date_on_or_before(price_df.index, current_date, buy_lag_days)
+            sell_date = trading_date_on_or_before(price_df.index, next_date, 0)
+            if buy_date is None or sell_date is None or buy_date >= sell_date:
+                continue
 
             current_cash = portfolio_value
             target_allocation = current_cash / self.top_n
 
-            current_prices = price_df.loc[:current_date]
+            current_prices = price_df.loc[:buy_date]
             if len(current_prices) <= lookback_days:
                 continue
 
@@ -173,18 +184,18 @@ class MomentumStrategy:
                 if spy_close is None or spy_close.empty:
                     continue
                 if buy_hold_shares is None:
-                    current_price = series_on_or_before(spy_close, current_date)
+                    current_price = series_on_or_before(spy_close, buy_date)
                     if pd.isna(current_price) or current_price <= 0:
                         continue
                     buy_hold_shares = int(current_cash / current_price)
                     buy_hold_cash = current_cash - (buy_hold_shares * current_price)
-                next_price = series_on_or_before(spy_close, next_date)
+                next_price = series_on_or_before(spy_close, sell_date)
                 if pd.isna(next_price) or next_price <= 0:
-                    next_price = series_on_or_before(spy_close, current_date)
+                    next_price = series_on_or_before(spy_close, buy_date)
                 portfolio_value = buy_hold_cash + (buy_hold_shares * next_price)
                 holdings_display = f"Cash(${buy_hold_cash:.0f}) + SPY({buy_hold_shares})"
                 history.append({
-                    "Date": next_date,
+                    "Date": sell_date,
                     "Value": portfolio_value,
                     "Return": (portfolio_value - current_cash) / current_cash * 100,
                     "Holdings": holdings_display
@@ -201,7 +212,7 @@ class MomentumStrategy:
             invested_amount = 0
 
             for ticker in top_stocks:
-                current_price = price_on_or_before(price_df, current_date, ticker)
+                current_price = price_on_or_before(price_df, buy_date, ticker)
 
                 if pd.isna(current_price) or current_price <= 0:
                     continue
@@ -237,9 +248,9 @@ class MomentumStrategy:
                 if item['shares'] > 0:
                     stock_details.append(f"{item['ticker']}({item['shares']} 개)")
 
-                    next_price = price_on_or_before(price_df, next_date, item['ticker'])
+                    next_price = price_on_or_before(price_df, sell_date, item['ticker'])
                     if pd.isna(next_price) or next_price <= 0:
-                        next_price = price_on_or_before(price_df, current_date, item['ticker'])
+                        next_price = price_on_or_before(price_df, buy_date, item['ticker'])
 
                     next_portfolio_value += item['shares'] * next_price
 
@@ -247,7 +258,7 @@ class MomentumStrategy:
             holdings_display = f"Cash(${leftover_cash:.0f}) + " + ", ".join(stock_details)
 
             history.append({
-                "Date": next_date,
+                "Date": sell_date,
                 "Value": portfolio_value,
                 "Return": (portfolio_value - current_cash) / current_cash * 100,
                 "Holdings": holdings_display
