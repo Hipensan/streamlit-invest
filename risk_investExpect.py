@@ -119,26 +119,6 @@ class MomentumStrategy:
         portfolio_value = 10000.0
         history = []
         start_idx = 1
-        # Find the first rebalance with enough data
-        start_idx = 1
-        for i in range(1, len(rebalance_prices) - 1):
-            current_date = rebalance_prices.index[i]
-            current_prices = price_df.loc[:current_date]
-            if len(current_prices) > lookback_days:
-                start_idx = i
-                break
-        buy_hold_cash = None
-        spy_close = spy_df['Close'] if isinstance(spy_df, pd.DataFrame) and 'Close' in spy_df.columns else None
-        held_stocks = []  # Track holdings across rebalance periods
-        leftover_cash = 0.0  # Track cash across rebalance periods
-        history = []
-        start_idx = 1
-        buy_hold_shares = None
-        buy_hold_cash = None
-        spy_close = spy_df['Close'] if isinstance(spy_df, pd.DataFrame) and 'Close' in spy_df.columns else None
-        held_stocks = []  # Track holdings across rebalance periods
-        history = []
-        start_idx = 1
         buy_hold_shares = None
         buy_hold_cash = None
         spy_close = spy_df['Close'] if isinstance(spy_df, pd.DataFrame) and 'Close' in spy_df.columns else None
@@ -188,11 +168,10 @@ class MomentumStrategy:
         for i in range(start_idx, len(rebalance_prices) - 1):
             current_date = rebalance_prices.index[i]
             next_date = rebalance_prices.index[i+1]
-            buy_date = trading_date_on_or_before(price_df.index, current_date, 0)
-            sell_date = trading_date_on_or_before(price_df.index, next_date, 1)
+            buy_date = trading_date_on_or_before(price_df.index, current_date, buy_lag_days)
+            sell_date = trading_date_on_or_before(price_df.index, next_date, 0)
             if buy_date is None or sell_date is None or buy_date >= sell_date:
                 continue
-
 
             current_cash = portfolio_value
             target_allocation = current_cash / self.top_n
@@ -229,141 +208,39 @@ class MomentumStrategy:
             top_series = score_series.sort_values(ascending=False).head(self.top_n)
             top_stocks = top_series.index.tolist()
 
-            # First rebalance: buy all top stocks
-            if i == start_idx:
-                held_stocks = []
-                invested_amount = 0
+            held_stocks = []  # (ticker, shares, buy_price)
+            invested_amount = 0
 
-                for ticker in top_stocks:
-                    current_price = price_on_or_before(price_df, buy_date, ticker)
-                    if pd.isna(current_price) or current_price <= 0:
-                        continue
-                    shares = int(target_allocation / current_price)
-                    cost = shares * current_price
-                    held_stocks.append({
-                        'ticker': ticker,
-                        'shares': shares,
-                        'price': current_price,
-                        'cost': cost
-                    })
-                    invested_amount += cost
+            for ticker in top_stocks:
+                current_price = price_on_or_before(price_df, buy_date, ticker)
 
-                leftover_cash = current_cash - invested_amount
+                if pd.isna(current_price) or current_price <= 0:
+                    continue
 
-                # Reinvest leftover cash
-                while True:
-                    bought_something = False
-                    for item in held_stocks:
-                        if leftover_cash >= item['price']:
-                            leftover_cash -= item['price']
-                            item['shares'] += 1
-                            item['cost'] += item['price']
-                            bought_something = True
-                    if not bought_something:
-                        break
-            # Subsequent rebalances: keep existing holdings, adjust differences
-            else:
-                held_tickers = {item['ticker'] for item in held_stocks}
-                top_set = set(top_stocks)
-                
-                # Keepers: existing holdings still in top stocks
-                keepers = [item for item in held_stocks if item['ticker'] in top_set]
-                
-                # New stocks: top stocks not currently held
-                new_stocks = [t for t in top_stocks if t not in held_tickers]
-                
-                # Removed stocks: currently held but not in top stocks
-                removed_stocks = [item for item in held_stocks if item['ticker'] not in top_set]
-                
-                # Calculate target portfolio value (sell removed stocks first)
-                sell_value = 0
-                for item in removed_stocks:
-                    sell_price = price_on_or_before(price_df, sell_date, item['ticker'])
-                    if pd.isna(sell_price) or sell_price <= 0:
-                        sell_price = price_on_or_before(price_df, buy_date, item['ticker'])
-                    sell_value += item['shares'] * sell_price
-                
-                # Include previous leftover cash
-                portfolio_value = current_cash + sell_value + leftover_cash
-                leftover_cash = portfolio_value
-                leftover_cash = portfolio_value
-                
-                # Allocate to keepers (existing holdings)
-                new_held_stocks = []
-                total_invested = 0
-                
-                for item in keepers:
-                    current_price = price_on_or_before(price_df, buy_date, item['ticker'])
-                    if pd.isna(current_price) or current_price <= 0:
-                        continue
-                    target_shares = int(target_allocation / current_price)
-                    
-                    # Buy or sell to reach target
-                    if target_shares > item['shares']:
-                        # Buy more
-                        buy_shares = target_shares - item['shares']
-                        buy_cost = buy_shares * current_price
-                        if leftover_cash >= buy_cost:
-                            new_shares = target_shares
-                            new_cost = new_shares * current_price
-                            leftover_cash -= buy_cost
-                        else:
-                            # Not enough cash, buy as much as possible
-                            new_shares = item['shares'] + int(leftover_cash / current_price)
-                            new_cost = new_shares * current_price
-                            leftover_cash -= (new_shares - item['shares']) * current_price
-                    elif target_shares < item['shares']:
-                        # Sell excess
-                        sell_shares = item['shares'] - target_shares
-                        sell_price_for_excess = price_on_or_before(price_df, sell_date, item['ticker'])
-                        if pd.isna(sell_price_for_excess) or sell_price_for_excess <= 0:
-                            sell_price_for_excess = current_price
-                        leftover_cash += sell_shares * sell_price_for_excess
-                        new_shares = target_shares
-                        new_cost = new_shares * current_price
-                    else:
-                        # No change
-                        new_shares = item['shares']
-                        new_cost = new_shares * current_price
-                    
-                    new_held_stocks.append({
-                        'ticker': item['ticker'],
-                        'shares': new_shares,
-                        'price': current_price,
-                        'cost': new_cost
-                    })
-                    total_invested += new_cost
-                
-                # Buy new stocks with remaining cash
-                for ticker in new_stocks:
-                    current_price = price_on_or_before(price_df, buy_date, ticker)
-                    if pd.isna(current_price) or current_price <= 0:
-                        continue
-                    shares = int(target_allocation / current_price)
-                    cost = shares * current_price
-                    
-                    if leftover_cash >= cost:
-                        new_held_stocks.append({
-                            'ticker': ticker,
-                            'shares': shares,
-                            'price': current_price,
-                            'cost': cost
-                        })
-                        leftover_cash -= cost
-                        total_invested += cost
-                
-                # Reinvest leftover cash
-                while True:
-                    bought_something = False
-                    for item in new_held_stocks:
-                        if leftover_cash >= item['price']:
-                            leftover_cash -= item['price']
-                            item['shares'] += 1
-                            item['cost'] += item['price']
-                            bought_something = True
-                    if not bought_something:
-                        break
-                
+                shares = int(target_allocation / current_price)
+                cost = shares * current_price
+
+                held_stocks.append({
+                    'ticker': ticker,
+                    'shares': shares,
+                    'price': current_price,
+                    'cost': cost
+                })
+                invested_amount += cost
+
+            leftover_cash = current_cash - invested_amount
+
+            while True:
+                bought_something = False
+                for item in held_stocks:
+                    if leftover_cash >= item['price']:
+                        leftover_cash -= item['price']
+                        item['shares'] += 1
+                        item['cost'] += item['price']
+                        bought_something = True
+                if not bought_something:
+                    break
+
             next_portfolio_value = leftover_cash
             stock_details = []
 
