@@ -21,7 +21,9 @@ python run_pipeline.py --start 2016-01-01 --top-n-values 5,10,15,20 --transactio
 python run_pipeline.py --top-n 10
 python run_pipeline.py --rebalance-frequencies monthly,quarterly
 python run_pipeline.py --rebalance-frequency weekly
+python run_pipeline.py --strategies momentum_6m,blend_momentum
 python run_pipeline.py --initial-capital 1000000
+python run_pipeline.py --rebalance-contribution 100000
 python run_pipeline.py --force-refresh
 ```
 
@@ -54,6 +56,8 @@ python run_pipeline.py --force-refresh
 
 - Signals are computed on the last trading day of each chosen rebalance period and traded on the next trading day's open.
 - Rebalance frequency is configurable: `weekly`, `monthly`, `bimonthly`, `quarterly`, `semiannual`, `annual`.
+- Strategies can be filtered in the Streamlit sidebar or with `--strategies` in the CLI.
+- Optional cash contributions can be added immediately before every scheduled rebalance.
 - Shares are integer-only. Fractional shares are not allowed.
 - The allocator aims for near-equal dollar exposure across selected names and keeps leftover cash when exact equality is impossible.
 - Trade logs include buy/sell price, share count, notional, and fee.

@@ -7,6 +7,7 @@ import pandas as pd
 
 from rebalance_lab.backtest import CONTROL_TICKERS, MonthlyBacktester, evaluate_strategies, save_result_artifacts
 from rebalance_lab.data import fetch_sp500_snapshot, load_or_refresh_price_cache, persist_universe_snapshot
+from rebalance_lab.strategies import build_strategy_library
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,10 +38,21 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated rebalance frequencies to compare",
     )
     parser.add_argument(
+        "--strategies",
+        default=None,
+        help="Comma-separated strategy names to compare. Defaults to all strategies.",
+    )
+    parser.add_argument(
         "--initial-capital",
         type=float,
         default=1_000_000.0,
         help="Initial capital for the integer-share simulation",
+    )
+    parser.add_argument(
+        "--rebalance-contribution",
+        type=float,
+        default=0.0,
+        help="Cash contribution added immediately before every scheduled rebalance",
     )
     parser.add_argument(
         "--transaction-cost-bps",
@@ -87,10 +99,27 @@ def parse_rebalance_frequencies(args: argparse.Namespace) -> list[str]:
     return unique_values
 
 
+def parse_strategy_names(args: argparse.Namespace) -> list[str] | None:
+    if args.strategies is None:
+        return None
+    supported = {strategy.name for strategy in build_strategy_library()}
+    values = [value.strip() for value in args.strategies.split(",") if value.strip()]
+    unique_values = []
+    for value in values:
+        if value not in supported:
+            raise ValueError(f"Unsupported strategy: {value}")
+        if value not in unique_values:
+            unique_values.append(value)
+    if not unique_values:
+        raise ValueError("At least one strategy must be provided.")
+    return unique_values
+
+
 def main() -> None:
     args = parse_args()
     top_n_values = parse_top_n_values(args)
     rebalance_frequencies = parse_rebalance_frequencies(args)
+    strategy_names = parse_strategy_names(args)
     project_root = Path(__file__).resolve().parent
     output_dir = project_root / "outputs"
     cache_dir = output_dir / "cache"
@@ -108,25 +137,30 @@ def main() -> None:
     )
     open_prices = price_bundle.open_prices
     close_prices = price_bundle.close_prices
+    volume_prices = price_bundle.volume_prices
 
     available_universe = [ticker for ticker in universe_snapshot.tickers if ticker in close_prices.columns]
     open_prices = open_prices.loc[:, available_universe + CONTROL_TICKERS]
     close_prices = close_prices.loc[:, available_universe + CONTROL_TICKERS]
+    volume_prices = volume_prices.loc[:, available_universe + CONTROL_TICKERS]
     eligible_from = build_eligibility_map(universe_snapshot.metadata, available_universe)
 
     backtester = MonthlyBacktester(
         open_prices=open_prices,
         close_prices=close_prices,
+        volume_prices=volume_prices,
         universe=available_universe,
         transaction_cost_bps=args.transaction_cost_bps,
         eligible_from=eligible_from,
         initial_capital=args.initial_capital,
         rebalance_frequency=rebalance_frequencies[0],
+        rebalance_contribution=args.rebalance_contribution,
     )
     runs = evaluate_strategies(
         backtester,
         top_n_values=top_n_values,
         rebalance_frequencies=rebalance_frequencies,
+        strategy_names=strategy_names,
     )
     summary, top_n_summary, best_run = save_result_artifacts(backtester, runs, output_dir)
 
@@ -141,6 +175,8 @@ def main() -> None:
         best_row=best_row,
         top_n_summary=top_n_summary,
         rebalance_frequencies=rebalance_frequencies,
+        strategy_names=strategy_names,
+        rebalance_contribution=args.rebalance_contribution,
         current_holdings=current_holdings,
         latest_recommendations=latest_recommendations,
     )
@@ -149,11 +185,14 @@ def main() -> None:
     print(f"Universe size used: {len(available_universe)} stocks")
     print(f"Top-N values tested: {', '.join(str(value) for value in top_n_values)}")
     print(f"Rebalance frequencies tested: {', '.join(rebalance_frequencies)}")
+    print(f"Strategies tested: {', '.join(strategy_names or [strategy.name for strategy in build_strategy_library()])}")
     print(f"Best strategy: {best_row['strategy']} ({best_row['description']})")
     print(f"Best Frequency: {best_row['rebalance_frequency']}")
     print(f"Best Top N: {int(best_row['top_n'])}")
     print("Execution assumption: signal on period-end close, trade on next trading day open")
     print(f"Initial capital: {best_row['initial_capital']:.2f}")
+    print(f"Total contributions: {best_row.get('total_contributions', 0.0):.2f}")
+    print(f"Total invested capital: {best_row.get('total_invested_capital', best_row['initial_capital']):.2f}")
     print(f"Total return: {best_row['total_return']:.2%}")
     print(f"CAGR: {best_row['cagr']:.2%}")
     print(f"Max drawdown: {best_row['max_drawdown']:.2%}")
@@ -204,21 +243,28 @@ def write_report(
     best_row: pd.Series,
     top_n_summary: pd.DataFrame,
     rebalance_frequencies: list[str],
+    strategy_names: list[str] | None,
+    rebalance_contribution: float,
     current_holdings: pd.DataFrame,
     latest_recommendations: pd.DataFrame,
 ) -> None:
+    tested_strategy_names = strategy_names or [strategy.name for strategy in build_strategy_library()]
     lines = [
         "# Monthly Rebalancing Report",
         "",
         f"- Latest completed market close used: {latest_market_date}",
         f"- Universe size used: {universe_size} stocks",
         f"- Rebalance frequencies tested: {', '.join(rebalance_frequencies)}",
+        f"- Strategies tested: {', '.join(tested_strategy_names)}",
         "- Execution assumption: signal on period-end close, trade on next trading day open",
         f"- Best strategy: {best_row['strategy']}",
         f"- Description: {best_row['description']}",
         f"- Best rebalance frequency: {best_row['rebalance_frequency']}",
         f"- Best top N: {int(best_row['top_n'])}",
         f"- Initial capital: {best_row['initial_capital']:.2f}",
+        f"- Rebalance contribution: {rebalance_contribution:.2f}",
+        f"- Total contributions: {best_row.get('total_contributions', 0.0):.2f}",
+        f"- Total invested capital: {best_row.get('total_invested_capital', best_row['initial_capital']):.2f}",
         f"- Total return: {best_row['total_return']:.2%}",
         f"- CAGR: {best_row['cagr']:.2%}",
         f"- Annual volatility: {best_row['annual_volatility']:.2%}",
@@ -255,6 +301,10 @@ def write_report(
     lines.extend(
         [
             "",
+            "## Daily Action Signals",
+            "",
+            "- outputs/daily_signals.csv: daily buy/add/trim/sell guidance based on the selected strategy",
+            "",
             "## Exported Files",
             "",
             "- outputs/backtest_summary.csv: all strategy x top-N combinations",
@@ -264,6 +314,7 @@ def write_report(
             "- outputs/monthly_portfolio_history.csv: portfolio after each rebalance",
             "- outputs/trade_log.csv: every buy and sell with prices",
             "- outputs/rebalance_summary.csv: one row per rebalance event",
+            "- outputs/daily_signals.csv: daily action guidance and target-weight gaps",
         ]
     )
     report_path = output_dir / "latest_report.md"

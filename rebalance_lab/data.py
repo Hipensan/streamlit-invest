@@ -31,6 +31,7 @@ class UniverseSnapshot:
 class PriceBundle:
     open_prices: pd.DataFrame
     close_prices: pd.DataFrame
+    volume_prices: pd.DataFrame
 
 
 def normalize_ticker(symbol: str) -> str:
@@ -82,6 +83,7 @@ def download_price_history(
     ]
     open_frames: list[pd.DataFrame] = []
     close_frames: list[pd.DataFrame] = []
+    volume_frames: list[pd.DataFrame] = []
     for chunk in chunks:
         raw = yf.download(
             tickers=chunk,
@@ -93,48 +95,62 @@ def download_price_history(
         )
         open_frame = _extract_field_frame(raw, "Open")
         close_frame = _extract_field_frame(raw, "Close")
+        volume_frame = _extract_field_frame(raw, "Volume")
         open_frames.append(open_frame)
         close_frames.append(close_frame)
+        volume_frames.append(volume_frame)
     combined_open = pd.concat(open_frames, axis=1)
     combined_open = combined_open.loc[:, ~combined_open.columns.duplicated()]
     combined_open = combined_open.dropna(axis=1, how="all")
     combined_close = pd.concat(close_frames, axis=1)
     combined_close = combined_close.loc[:, ~combined_close.columns.duplicated()]
     combined_close = combined_close.dropna(axis=1, how="all")
-    common_columns = sorted(set(combined_open.columns).intersection(combined_close.columns))
+    combined_volume = pd.concat(volume_frames, axis=1)
+    combined_volume = combined_volume.loc[:, ~combined_volume.columns.duplicated()]
+    combined_volume = combined_volume.dropna(axis=1, how="all")
+    common_columns = sorted(
+        set(combined_open.columns).intersection(combined_close.columns).intersection(combined_volume.columns)
+    )
     return PriceBundle(
         open_prices=combined_open[common_columns],
         close_prices=combined_close[common_columns],
+        volume_prices=combined_volume[common_columns],
     )
 
 
 def _bundle_to_cache_frame(bundle: PriceBundle) -> pd.DataFrame:
     open_frame = bundle.open_prices.copy()
     close_frame = bundle.close_prices.copy()
+    volume_frame = bundle.volume_prices.copy()
     open_frame.columns = [f"OPEN__{column}" for column in open_frame.columns]
     close_frame.columns = [f"CLOSE__{column}" for column in close_frame.columns]
-    combined = pd.concat([open_frame, close_frame], axis=1).sort_index()
+    volume_frame.columns = [f"VOLUME__{column}" for column in volume_frame.columns]
+    combined = pd.concat([open_frame, close_frame, volume_frame], axis=1).sort_index()
     return combined
 
 
 def _cache_frame_to_bundle(frame: pd.DataFrame) -> PriceBundle | None:
     open_columns = [column for column in frame.columns if str(column).startswith("OPEN__")]
     close_columns = [column for column in frame.columns if str(column).startswith("CLOSE__")]
+    volume_columns = [column for column in frame.columns if str(column).startswith("VOLUME__")]
     if not open_columns or not close_columns:
         return None
     open_prices = frame[open_columns].copy()
     open_prices.columns = [str(column).replace("OPEN__", "", 1) for column in open_prices.columns]
     close_prices = frame[close_columns].copy()
     close_prices.columns = [str(column).replace("CLOSE__", "", 1) for column in close_prices.columns]
-    common_columns = sorted(set(open_prices.columns).intersection(close_prices.columns))
+    volume_prices = frame[volume_columns].copy() if volume_columns else pd.DataFrame(index=frame.index)
+    volume_prices.columns = [str(column).replace("VOLUME__", "", 1) for column in volume_prices.columns]
+    common_columns = sorted(set(open_prices.columns).intersection(close_prices.columns).intersection(volume_prices.columns))
     return PriceBundle(
         open_prices=open_prices[common_columns].sort_index(),
         close_prices=close_prices[common_columns].sort_index(),
+        volume_prices=volume_prices[common_columns].sort_index(),
     )
 
 
 def _bundle_covers_request(bundle: PriceBundle, start: str, end: str | None) -> bool:
-    if bundle.close_prices.empty or bundle.open_prices.empty:
+    if bundle.close_prices.empty or bundle.open_prices.empty or bundle.volume_prices.empty:
         return False
     requested_start = pd.Timestamp(start).tz_localize(None)
     available_start = bundle.close_prices.index.min()

@@ -10,6 +10,8 @@ import pandas as pd
 class Strategy:
     name: str
     description: str
+    allocation_mode: str = "equal_weight"
+    min_turnover: float = 0.0
 
 
 def equal_weight(selection: pd.Index | list[str], all_tickers: list[str]) -> pd.Series:
@@ -75,5 +77,23 @@ def build_strategy_library() -> list[Strategy]:
         Strategy(
             name="blend_momentum",
             description="Top N by blended 6m/12m momentum and lower volatility",
+        ),
+        Strategy(
+            name="volume_confirmed_momentum",
+            description="Top N by 6-month momentum only when supported by stronger-than-average volume",
+            allocation_mode="inverse_volatility",
+            min_turnover=0.05,
+        ),
+        Strategy(
+            name="volume_adjusted_momentum",
+            description="Top N by 6-month momentum boosted by relative volume and penalized by volatility",
+            allocation_mode="inverse_volatility",
+            min_turnover=0.05,
+        ),
+        Strategy(
+            name="drawdown_filtered_momentum",
+            description="Top N by blended momentum while avoiding names in deeper 6-month drawdowns",
+            allocation_mode="inverse_volatility",
+            min_turnover=0.04,
         ),
     ]
