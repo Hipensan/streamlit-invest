@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--initial-capital",
         type=float,
-        default=1_000_000.0,
+        default=10_000.0,
         help="Initial capital for the integer-share simulation",
     )
     parser.add_argument(
@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--transaction-cost-bps",
         type=float,
-        default=10.0,
+        default=7.0,
         help="One-way cost applied on traded notional in basis points",
     )
     parser.add_argument(

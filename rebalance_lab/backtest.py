@@ -70,10 +70,10 @@ class MonthlyBacktester:
         close_prices: pd.DataFrame,
         volume_prices: pd.DataFrame | None,
         universe: list[str],
-        transaction_cost_bps: float = 10.0,
+        transaction_cost_bps: float = 7.0,
         benchmark_ticker: str = "SPY",
         eligible_from: dict[str, pd.Timestamp] | None = None,
-        initial_capital: float = 1_000_000.0,
+        initial_capital: float = 10_000.0,
         rebalance_frequency: str = "monthly",
         rebalance_contribution: float = 0.0,
     ) -> None:

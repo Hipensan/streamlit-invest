@@ -17,12 +17,12 @@ streamlit run app.py
 Example options:
 
 ```bash
-python run_pipeline.py --start 2016-01-01 --top-n-values 5,10,15,20 --transaction-cost-bps 10
+python run_pipeline.py --start 2016-01-01 --top-n-values 5,10,15,20 --transaction-cost-bps 7
 python run_pipeline.py --top-n 10
 python run_pipeline.py --rebalance-frequencies monthly,quarterly
 python run_pipeline.py --rebalance-frequency weekly
 python run_pipeline.py --strategies momentum_6m,blend_momentum
-python run_pipeline.py --initial-capital 1000000
+python run_pipeline.py --initial-capital 10000
 python run_pipeline.py --rebalance-contribution 100000
 python run_pipeline.py --force-refresh
 ```

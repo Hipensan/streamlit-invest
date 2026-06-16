@@ -787,7 +787,7 @@ def main() -> None:
             help="입력 가능: weekly, monthly, bimonthly, quarterly, semiannual, annual",
         )
         strategy_names = selected_strategy_names_from_checkboxes()
-        initial_capital = st.number_input("초기 자본", min_value=10000.0, value=1_000_000.0, step=10000.0)
+        initial_capital = st.number_input("초기 자본", min_value=10000.0, value=10_000.0, step=10000.0)
         rebalance_contribution = st.number_input(
             "리밸런싱마다 추가 납입금",
             min_value=0.0,
@@ -795,7 +795,7 @@ def main() -> None:
             step=10000.0,
             help="각 리밸런싱 체결 직전에 현금으로 추가 투입되는 금액입니다.",
         )
-        transaction_cost_bps = st.number_input("거래 비용 bps", min_value=0.0, value=10.0, step=1.0)
+        transaction_cost_bps = st.number_input("거래 비용 bps", min_value=0.0, value=7.0, step=1.0)
         force_refresh = st.checkbox("가격 캐시 강제 새로고침", value=False)
         run_clicked = st.button("백테스트 실행", use_container_width=True, type="primary")
         load_clicked = st.button("기존 결과 불러오기", use_container_width=True)
