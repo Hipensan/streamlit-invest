@@ -312,7 +312,30 @@ def materialize_selected_results(results: dict[str, object], selected_row: pd.Se
     return selected
 
 
-def render_metric_strip(best_row: pd.Series, latest_market_date: str, universe_size: int | None) -> None:
+def render_metric_strip(
+    best_row: pd.Series,
+    latest_market_date: str,
+    universe_size: int | None,
+    next_rebalance_dates: tuple[pd.Timestamp, pd.Timestamp] | None = None
+) -> None:
+    next_rebal_html = ""
+    if next_rebalance_dates is not None:
+        next_rebal_html = f"""
+        <div style="
+            font-size: 0.95rem;
+            color: #0e6a75;
+            font-weight: 600;
+            margin-top: 0.55rem;
+            background: rgba(18, 106, 117, 0.08);
+            padding: 0.45rem 0.75rem;
+            border-radius: 10px;
+            display: inline-block;
+            border: 1px solid rgba(18, 106, 117, 0.15);
+        ">
+            📅 예정된 다음 리밸런싱: 신호일 <strong>{next_rebalance_dates[0].strftime('%Y-%m-%d')}</strong> ➔ 실행일 <strong>{next_rebalance_dates[1].strftime('%Y-%m-%d')}</strong>
+        </div>
+        """
+
     st.markdown(
         f"""
         <div style="
@@ -333,6 +356,7 @@ def render_metric_strip(best_row: pd.Series, latest_market_date: str, universe_s
             <div style="font-size:0.92rem; color:#5d727a; margin-top:0.35rem; word-break:break-word;">
                 설명: {best_row["description"]}
             </div>
+            {next_rebal_html}
         </div>
         """,
         unsafe_allow_html=True,
@@ -352,8 +376,8 @@ def render_metric_strip(best_row: pd.Series, latest_market_date: str, universe_s
     if "total_contributions" in best_row and float(best_row["total_contributions"]) > 0:
         meta_parts.append(f"총 추가 납입: {num(float(best_row['total_contributions']))}")
     meta_parts.append(f"실제 성과 집계 구간: {best_row['start_date']} ~ {best_row['end_date']}")
-    meta_parts.append("신호 계산: 주기 말 종가")
-    meta_parts.append("실행 시점: 다음 거래일 시가")
+    meta_parts.append("신호 계산: 주기 말 종가 (종목 평가 및 비중 확정)")
+    meta_parts.append("실행 시점: 다음 거래일 시가 (매도/매수 동시 집행)")
     st.caption(" | ".join(meta_parts))
 
 
@@ -432,7 +456,7 @@ def render_rebalance_explorer(
     col2.metric("실행일", str(summary_row["effective_date"]))
     col3.metric("회전율", pct(float(summary_row["turnover"])))
     col4.metric("수수료", num(float(summary_row["fees"])))
-    st.caption("신호는 기준일 종가로 계산하고, 실제 매매는 실행일 시가에 이뤄집니다.")
+    st.caption("신호 기준일 종가로 어떤 종목을 교체할지 계산한 뒤, 실제 매매(기존 종목 매도 및 신규 종목 매수)는 그다음 영업일(실행일) 시가에 동시에 체결됩니다.")
 
     portfolio = monthly_portfolio_history[monthly_portfolio_history["rebalance_no"] == selected_no].copy()
     trades = trade_log[trade_log["rebalance_no"] == selected_no].copy()
@@ -507,8 +531,8 @@ def render_recommendations(latest_recommendations: pd.DataFrame) -> None:
         return
     if "as_of" in recommendations.columns:
         st.caption(
-            f"신호 기준일: {recommendations['as_of'].iloc[0]} 종가 기준입니다. "
-            "실제 주문 체결은 다음 거래일 시가 기준입니다."
+            f"신호 기준일: {recommendations['as_of'].iloc[0]} 종가 기준으로 종목을 평가합니다. "
+            "실제 포트폴리오 교체 주문(매도 및 매수)은 다음 거래일 시가에 동시에 집행됩니다."
         )
     display = recommendations[["ticker", "score", "latest_price", "ret_1m", "ret_6m", "ret_12m", "selected"]].copy()
     display["score"] = display["score"].map(lambda x: f"{x:,.4f}")
@@ -803,7 +827,7 @@ def main() -> None:
             "리밸런싱 일수 앞당김 (시프트 데이)",
             min_value=0,
             max_value=30,
-            value=7,
+            value=30,
             help="리밸런싱 날짜를 주기 말(월말 등)보다 몇 일 앞당길지 설정합니다. 비영업일일 경우 직전 영업일로 보정됩니다.",
         )
         force_refresh = st.checkbox("가격 캐시 강제 새로고침", value=False)
@@ -881,7 +905,27 @@ def main() -> None:
         view_results = materialize_selected_results(results, selected_row, selected_run)
         st.info("현재는 저장된 결과만 불러온 상태라 최고 조합 기준만 볼 수 있습니다. 조합 선택은 앱에서 백테스트를 새로 실행하면 사용할 수 있습니다.")
 
-    render_metric_strip(selected_row, str(view_results.get("latest_market_date", "")), view_results.get("universe_size"))
+    from rebalance_lab.backtest import calculate_next_rebalance_date
+    next_rebal_dates = None
+    latest_mkt_date_str = str(view_results.get("latest_market_date", ""))
+    if latest_mkt_date_str:
+        try:
+            current_shift = rebalance_shift_days if 'rebalance_shift_days' in locals() else 7
+            next_rebal_dates = calculate_next_rebalance_date(
+                latest_market_date=pd.Timestamp(latest_mkt_date_str),
+                rebalance_frequency=str(selected_row["rebalance_frequency"]),
+                rebalance_shift_days=current_shift,
+                non_trading_day_adjustment="prior",
+            )
+        except Exception:
+            pass
+
+    render_metric_strip(
+        selected_row,
+        latest_mkt_date_str,
+        view_results.get("universe_size"),
+        next_rebal_dates
+    )
     st.caption(
         "비교한 주기: " + ", ".join(frequency_label(value) for value in results.get("rebalance_frequencies", ["monthly"]))
     )

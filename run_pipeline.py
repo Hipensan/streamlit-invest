@@ -68,8 +68,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rebalance-shift-days",
         type=int,
-        default=7,
-        help="Number of days to shift rebalance date earlier (default: 7)",
+        default=30,
+        help="Number of days to shift rebalance date earlier (default: 30)",
     )
     return parser.parse_args()
 

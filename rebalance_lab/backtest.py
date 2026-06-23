@@ -76,7 +76,7 @@ class MonthlyBacktester:
         initial_capital: float = 10_000.0,
         rebalance_frequency: str = "monthly",
         rebalance_contribution: float = 0.0,
-        rebalance_shift_days: int = 7,
+        rebalance_shift_days: int = 30,
         non_trading_day_adjustment: str = "prior",
     ) -> None:
         self.open_prices = open_prices.sort_index().copy()
@@ -806,6 +806,15 @@ class MonthlyBacktester:
         frame["selected"] = frame["ticker"].isin(selected)
         return latest_date, frame.head(max(top_n, 20)).reset_index(drop=True)
 
+    def get_next_scheduled_rebalance(self) -> tuple[pd.Timestamp, pd.Timestamp]:
+        latest_market_date = self.close_prices.index[-1]
+        return calculate_next_rebalance_date(
+            latest_market_date=latest_market_date,
+            rebalance_frequency=self.rebalance_frequency,
+            rebalance_shift_days=self.rebalance_shift_days,
+            non_trading_day_adjustment=self.non_trading_day_adjustment,
+        )
+
     def build_daily_signals(
         self,
         strategy: Strategy,
@@ -986,3 +995,94 @@ def save_result_artifacts(
     best_run.rebalance_summary.to_csv(output_dir / "rebalance_summary.csv", index=False)
 
     return summary, top_n_summary, best_run
+
+
+def calculate_next_rebalance_date(
+    latest_market_date: pd.Timestamp,
+    rebalance_frequency: str,
+    rebalance_shift_days: int,
+    non_trading_day_adjustment: str = "prior",
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    future_index = pd.bdate_range(
+        start=latest_market_date - pd.Timedelta(days=45),
+        end=latest_market_date + pd.Timedelta(days=450)
+    )
+    temp_close = pd.DataFrame(index=future_index)
+    
+    frequency = rebalance_frequency.lower()
+    if frequency == "weekly":
+        grouped = temp_close.groupby(pd.Grouper(freq="W-FRI")).tail(1).index
+        original_dates = pd.Index(grouped)
+    elif frequency == "monthly":
+        grouped = temp_close.groupby(temp_close.index.to_period("M")).tail(1).index
+        original_dates = pd.Index(grouped)
+    elif frequency == "bimonthly":
+        grouped = temp_close.groupby(temp_close.index.to_period("M")).tail(1)
+        month_ends = grouped.index
+        month_numbers = month_ends.to_period("M").month
+        original_dates = pd.Index(month_ends[month_numbers % 2 == 0])
+    elif frequency == "quarterly":
+        grouped = temp_close.groupby(temp_close.index.to_period("Q")).tail(1).index
+        original_dates = pd.Index(grouped)
+    elif frequency == "semiannual":
+        grouped = temp_close.groupby(temp_close.index.to_period("Q")).tail(1)
+        quarter_ends = grouped.index
+        quarter_numbers = quarter_ends.to_period("Q").quarter
+        original_dates = pd.Index(quarter_ends[quarter_numbers.isin([2, 4])])
+    elif frequency == "annual":
+        grouped = temp_close.groupby(temp_close.index.to_period("Y")).tail(1).index
+        original_dates = pd.Index(grouped)
+    else:
+        original_dates = pd.Index([latest_market_date])
+
+    if rebalance_shift_days == 0:
+        adjusted_dates = original_dates
+    else:
+        adjusted_dates = []
+        trading_days = temp_close.index
+        for d in original_dates:
+            target = d - pd.Timedelta(days=rebalance_shift_days)
+            if target in trading_days:
+                adjusted_dates.append(target)
+            else:
+                if non_trading_day_adjustment == "prior":
+                    prior_days = trading_days[trading_days < target]
+                    if not prior_days.empty:
+                        adjusted_dates.append(prior_days[-1])
+                    else:
+                        following_days = trading_days[trading_days > target]
+                        if not following_days.empty:
+                            adjusted_dates.append(following_days[0])
+                elif non_trading_day_adjustment == "following":
+                    following_days = trading_days[trading_days > target]
+                    if not following_days.empty:
+                        adjusted_dates.append(following_days[0])
+                    else:
+                        prior_days = trading_days[trading_days < target]
+                        if not prior_days.empty:
+                            adjusted_dates.append(prior_days[-1])
+                elif non_trading_day_adjustment == "nearest":
+                    idx = trading_days.get_indexer([target], method="nearest")[0]
+                    adjusted_dates.append(trading_days[idx])
+                else:
+                    adjusted_dates.append(target)
+
+        adjusted_dates = sorted(list(set(adjusted_dates)))
+
+    next_signal = None
+    for sd in adjusted_dates:
+        if sd > latest_market_date:
+            next_signal = sd
+            break
+
+    if next_signal is None:
+        next_signal = latest_market_date + pd.Timedelta(days=30)
+
+    trading_days = temp_close.index
+    idx = trading_days.get_loc(next_signal)
+    if idx + 1 < len(trading_days):
+        next_effective = trading_days[idx + 1]
+    else:
+        next_effective = next_signal + pd.Timedelta(days=1)
+
+    return next_signal, next_effective
