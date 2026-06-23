@@ -77,6 +77,7 @@ def run_backtest(
     rebalance_contribution: float,
     transaction_cost_bps: float,
     force_refresh: bool,
+    rebalance_shift_days: int,
 ) -> dict[str, object]:
     universe_snapshot = fetch_sp500_snapshot()
     persist_universe_snapshot(universe_snapshot, OUTPUT_DIR / "sp500_snapshot.csv")
@@ -108,6 +109,8 @@ def run_backtest(
         initial_capital=initial_capital,
         rebalance_frequency=rebalance_frequencies[0],
         rebalance_contribution=rebalance_contribution,
+        rebalance_shift_days=rebalance_shift_days,
+        non_trading_day_adjustment="prior",
     )
     runs = evaluate_strategies(
         backtester,
@@ -796,6 +799,13 @@ def main() -> None:
             help="각 리밸런싱 체결 직전에 현금으로 추가 투입되는 금액입니다.",
         )
         transaction_cost_bps = st.number_input("거래 비용 bps", min_value=0.0, value=7.0, step=1.0)
+        rebalance_shift_days = st.slider(
+            "리밸런싱 일수 앞당김 (시프트 데이)",
+            min_value=0,
+            max_value=30,
+            value=7,
+            help="리밸런싱 날짜를 주기 말(월말 등)보다 몇 일 앞당길지 설정합니다. 비영업일일 경우 직전 영업일로 보정됩니다.",
+        )
         force_refresh = st.checkbox("가격 캐시 강제 새로고침", value=False)
         run_clicked = st.button("백테스트 실행", use_container_width=True, type="primary")
         load_clicked = st.button("기존 결과 불러오기", use_container_width=True)
@@ -822,6 +832,7 @@ def main() -> None:
                     rebalance_contribution=rebalance_contribution,
                     transaction_cost_bps=transaction_cost_bps,
                     force_refresh=force_refresh,
+                    rebalance_shift_days=rebalance_shift_days,
                 )
             st.success("백테스트가 완료되었습니다.")
         except Exception as exc:

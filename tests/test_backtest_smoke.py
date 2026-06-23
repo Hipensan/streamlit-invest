@@ -40,6 +40,7 @@ def test_monthly_backtester_runs_on_synthetic_prices() -> None:
         universe=["AAA", "BBB", "CCC"],
         transaction_cost_bps=0.0,
         initial_capital=10_000.0,
+        rebalance_shift_days=0,
     )
     run = backtester.run(
         Strategy(name="momentum_12m", description="synthetic test"),
@@ -85,6 +86,7 @@ def test_volume_confirmed_momentum_prefers_supported_liquid_names() -> None:
         universe=["AAA", "BBB", "CCC"],
         transaction_cost_bps=0.0,
         initial_capital=10_000.0,
+        rebalance_shift_days=0,
     )
 
     selected, ranking = backtester.select_target_tickers(
@@ -127,6 +129,7 @@ def test_inverse_volatility_allocation_overweights_lower_vol_names() -> None:
         universe=["AAA", "BBB", "CCC"],
         transaction_cost_bps=0.0,
         initial_capital=10_000.0,
+        rebalance_shift_days=0,
     )
 
     weights = backtester._build_target_weights(
@@ -167,6 +170,7 @@ def test_turnover_guard_keeps_existing_holdings_when_trade_is_too_small() -> Non
         universe=["AAA", "BBB", "CCC"],
         transaction_cost_bps=0.0,
         initial_capital=10_000.0,
+        rebalance_shift_days=0,
     )
     current_shares = pd.Series({"AAA": 45, "BBB": 45, "CCC": 0}, dtype=int)
     current_cash = 200.0
@@ -229,6 +233,7 @@ def test_rebalance_frequency_changes_trade_count() -> None:
         transaction_cost_bps=0.0,
         initial_capital=10_000.0,
         rebalance_frequency="monthly",
+        rebalance_shift_days=0,
     )
     monthly_run = backtester.run(Strategy(name="momentum_6m", description="synthetic test"), top_n=2)
     backtester.set_rebalance_frequency("quarterly")
@@ -265,6 +270,7 @@ def test_evaluate_strategies_can_filter_selected_strategies() -> None:
         transaction_cost_bps=0.0,
         initial_capital=10_000.0,
         rebalance_frequency="monthly",
+        rebalance_shift_days=0,
     )
 
     runs = evaluate_strategies(
@@ -307,6 +313,7 @@ def test_rebalance_contribution_is_added_to_cash_flow() -> None:
         initial_capital=10_000.0,
         rebalance_frequency="monthly",
         rebalance_contribution=1_000.0,
+        rebalance_shift_days=0,
     )
 
     run = backtester.run(Strategy(name="momentum_6m", description="synthetic test"), top_n=2)
@@ -349,6 +356,7 @@ def test_daily_signal_follow_is_distinct_from_quarterly_backtest() -> None:
         transaction_cost_bps=0.0,
         initial_capital=10_000.0,
         rebalance_frequency="quarterly",
+        rebalance_shift_days=0,
     )
 
     quarterly_run = backtester.run(strategy, top_n=2)
@@ -373,6 +381,39 @@ def test_purchase_plan_uses_integer_shares_and_leaves_cash() -> None:
     assert (plan["shares_to_buy"] % 1 == 0).all()
     assert cash_left >= 0
     assert plan["actual_value"].sum() <= 1000.0 + 1e-9
+
+
+def test_rebalance_shift_and_adjustment() -> None:
+    index = pd.bdate_range("2023-01-02", "2023-02-28")
+    # Remove 2023-01-24 to simulate a non-trading day (since 1월 31일 - 7일 = 24일)
+    index = index[index != "2023-01-24"]
+
+    close_prices = pd.DataFrame(
+        {
+            "AAA": np.linspace(100, 120, len(index)),
+            "SPY": np.linspace(100, 110, len(index)),
+        },
+        index=index,
+    )
+    open_prices = close_prices * 0.99
+
+    backtester = MonthlyBacktester(
+        open_prices=open_prices,
+        close_prices=close_prices,
+        volume_prices=None,
+        universe=["AAA"],
+        rebalance_frequency="monthly",
+        rebalance_shift_days=7,
+        non_trading_day_adjustment="prior",
+    )
+
+    signal_dates = backtester._build_signal_dates()
+    # 2023-01-31 is the last trading day of Jan 2023.
+    # 7 days earlier is 2023-01-24, which we removed.
+    # The prior trading day should be 2023-01-23 (Monday).
+    assert pd.Timestamp("2023-01-23") in signal_dates
+    assert pd.Timestamp("2023-01-24") not in signal_dates
+
 
 
 def test_price_cache_refreshes_when_requested_range_is_not_covered(monkeypatch) -> None:

@@ -76,6 +76,8 @@ class MonthlyBacktester:
         initial_capital: float = 10_000.0,
         rebalance_frequency: str = "monthly",
         rebalance_contribution: float = 0.0,
+        rebalance_shift_days: int = 7,
+        non_trading_day_adjustment: str = "prior",
     ) -> None:
         self.open_prices = open_prices.sort_index().copy()
         self.close_prices = close_prices.sort_index().copy()
@@ -94,6 +96,8 @@ class MonthlyBacktester:
         self.initial_capital = float(initial_capital)
         self.rebalance_contribution = float(rebalance_contribution)
         self.rebalance_frequency = rebalance_frequency
+        self.rebalance_shift_days = rebalance_shift_days
+        self.non_trading_day_adjustment = non_trading_day_adjustment
         self.eligible_from = {ticker: None for ticker in self.universe}
         if eligible_from:
             for ticker, value in eligible_from.items():
@@ -135,27 +139,63 @@ class MonthlyBacktester:
         frequency = self.rebalance_frequency.lower()
         if frequency == "weekly":
             grouped = self.close_prices.groupby(pd.Grouper(freq="W-FRI")).tail(1).index
-            return pd.Index(grouped)
-        if frequency == "monthly":
+            original_dates = pd.Index(grouped)
+        elif frequency == "monthly":
             grouped = self.close_prices.groupby(self.close_prices.index.to_period("M")).tail(1).index
-            return pd.Index(grouped)
-        if frequency == "bimonthly":
+            original_dates = pd.Index(grouped)
+        elif frequency == "bimonthly":
             grouped = self.close_prices.groupby(self.close_prices.index.to_period("M")).tail(1)
             month_ends = grouped.index
             month_numbers = month_ends.to_period("M").month
-            return pd.Index(month_ends[month_numbers % 2 == 0])
-        if frequency == "quarterly":
+            original_dates = pd.Index(month_ends[month_numbers % 2 == 0])
+        elif frequency == "quarterly":
             grouped = self.close_prices.groupby(self.close_prices.index.to_period("Q")).tail(1).index
-            return pd.Index(grouped)
-        if frequency == "semiannual":
+            original_dates = pd.Index(grouped)
+        elif frequency == "semiannual":
             grouped = self.close_prices.groupby(self.close_prices.index.to_period("Q")).tail(1)
             quarter_ends = grouped.index
             quarter_numbers = quarter_ends.to_period("Q").quarter
-            return pd.Index(quarter_ends[quarter_numbers.isin([2, 4])])
-        if frequency == "annual":
+            original_dates = pd.Index(quarter_ends[quarter_numbers.isin([2, 4])])
+        elif frequency == "annual":
             grouped = self.close_prices.groupby(self.close_prices.index.to_period("Y")).tail(1).index
-            return pd.Index(grouped)
-        raise ValueError(f"Unsupported rebalance frequency: {self.rebalance_frequency}")
+            original_dates = pd.Index(grouped)
+        else:
+            raise ValueError(f"Unsupported rebalance frequency: {self.rebalance_frequency}")
+
+        if self.rebalance_shift_days == 0:
+            return original_dates
+
+        adjusted_dates = []
+        trading_days = self.close_prices.index
+        for d in original_dates:
+            target = d - pd.Timedelta(days=self.rebalance_shift_days)
+            if target in trading_days:
+                adjusted_dates.append(target)
+            else:
+                if self.non_trading_day_adjustment == "prior":
+                    prior_days = trading_days[trading_days < target]
+                    if not prior_days.empty:
+                        adjusted_dates.append(prior_days[-1])
+                    else:
+                        following_days = trading_days[trading_days > target]
+                        if not following_days.empty:
+                            adjusted_dates.append(following_days[0])
+                elif self.non_trading_day_adjustment == "following":
+                    following_days = trading_days[trading_days > target]
+                    if not following_days.empty:
+                        adjusted_dates.append(following_days[0])
+                    else:
+                        prior_days = trading_days[trading_days < target]
+                        if not prior_days.empty:
+                            adjusted_dates.append(prior_days[-1])
+                elif self.non_trading_day_adjustment == "nearest":
+                    idx = trading_days.get_indexer([target], method="nearest")[0]
+                    adjusted_dates.append(trading_days[idx])
+                else:
+                    adjusted_dates.append(target)
+
+        adjusted_dates = sorted(list(set(adjusted_dates)))
+        return pd.Index(adjusted_dates)
 
     def _benchmark_uptrend(self, date: pd.Timestamp) -> bool:
         benchmark_price = self.close_prices.at[date, self.benchmark_ticker]

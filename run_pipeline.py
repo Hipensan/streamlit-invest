@@ -65,6 +65,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Ignore cached price data and download again",
     )
+    parser.add_argument(
+        "--rebalance-shift-days",
+        type=int,
+        default=7,
+        help="Number of days to shift rebalance date earlier (default: 7)",
+    )
     return parser.parse_args()
 
 
@@ -155,6 +161,8 @@ def main() -> None:
         initial_capital=args.initial_capital,
         rebalance_frequency=rebalance_frequencies[0],
         rebalance_contribution=args.rebalance_contribution,
+        rebalance_shift_days=args.rebalance_shift_days,
+        non_trading_day_adjustment="prior",
     )
     runs = evaluate_strategies(
         backtester,

@@ -39,17 +39,30 @@ def normalize_ticker(symbol: str) -> str:
 
 
 def fetch_sp500_snapshot() -> UniverseSnapshot:
-    response = requests.get(WIKI_SP500_URL, headers=REQUEST_HEADERS, timeout=30)
-    response.raise_for_status()
-    tables = pd.read_html(StringIO(response.text))
-    constituents = tables[0].copy()
-    constituents["Symbol"] = constituents["Symbol"].map(normalize_ticker)
-    constituents = constituents.drop_duplicates(subset=["Symbol"]).reset_index(drop=True)
-    return UniverseSnapshot(
-        as_of=pd.Timestamp.utcnow().strftime("%Y-%m-%d"),
-        tickers=constituents["Symbol"].tolist(),
-        metadata=constituents,
-    )
+    local_path = Path(__file__).resolve().parent.parent / "outputs" / "sp500_snapshot.csv"
+    try:
+        response = requests.get(WIKI_SP500_URL, headers=REQUEST_HEADERS, timeout=5)
+        response.raise_for_status()
+        tables = pd.read_html(StringIO(response.text))
+        constituents = tables[0].copy()
+        constituents["Symbol"] = constituents["Symbol"].map(normalize_ticker)
+        constituents = constituents.drop_duplicates(subset=["Symbol"]).reset_index(drop=True)
+        return UniverseSnapshot(
+            as_of=pd.Timestamp.utcnow().strftime("%Y-%m-%d"),
+            tickers=constituents["Symbol"].tolist(),
+            metadata=constituents,
+        )
+    except Exception as e:
+        if local_path.exists():
+            constituents = pd.read_csv(local_path)
+            constituents["Symbol"] = constituents["Symbol"].map(normalize_ticker)
+            constituents = constituents.drop_duplicates(subset=["Symbol"]).reset_index(drop=True)
+            return UniverseSnapshot(
+                as_of=pd.Timestamp.fromtimestamp(local_path.stat().st_mtime).strftime("%Y-%m-%d"),
+                tickers=constituents["Symbol"].tolist(),
+                metadata=constituents,
+            )
+        raise e
 
 
 def _extract_field_frame(raw: pd.DataFrame | pd.Series, field: str) -> pd.DataFrame:
@@ -154,7 +167,7 @@ def _bundle_covers_request(bundle: PriceBundle, start: str, end: str | None) -> 
         return False
     requested_start = pd.Timestamp(start).tz_localize(None)
     available_start = bundle.close_prices.index.min()
-    if pd.isna(available_start) or available_start > requested_start:
+    if pd.isna(available_start) or available_start > requested_start + pd.Timedelta(days=7):
         return False
     if end is not None:
         requested_end = pd.Timestamp(end).tz_localize(None)
@@ -173,13 +186,27 @@ def load_or_refresh_price_cache(
 ) -> PriceBundle:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     if cache_path.exists() and not force_refresh:
-        cached = pd.read_parquet(cache_path)
-        bundle = _cache_frame_to_bundle(cached)
-        if bundle is not None and _bundle_covers_request(bundle, start=start, end=end):
-            return bundle
-    bundle = download_price_history(tickers=tickers, start=start, end=end)
-    _bundle_to_cache_frame(bundle).to_parquet(cache_path)
-    return bundle
+        try:
+            cached = pd.read_parquet(cache_path)
+            bundle = _cache_frame_to_bundle(cached)
+            if bundle is not None and _bundle_covers_request(bundle, start=start, end=end):
+                return bundle
+        except Exception:
+            pass
+    try:
+        bundle = download_price_history(tickers=tickers, start=start, end=end)
+        _bundle_to_cache_frame(bundle).to_parquet(cache_path)
+        return bundle
+    except Exception as e:
+        if cache_path.exists():
+            try:
+                cached = pd.read_parquet(cache_path)
+                bundle = _cache_frame_to_bundle(cached)
+                if bundle is not None:
+                    return bundle
+            except Exception:
+                pass
+        raise e
 
 
 def persist_universe_snapshot(snapshot: UniverseSnapshot, path: Path) -> None:
