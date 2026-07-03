@@ -676,3 +676,77 @@ def test_rebalance_pnl_tracking() -> None:
     expected_shares = sell_trade["shares"]
     assert sell_trade["realized_pnl"] == expected_shares * 20.0
     assert abs(sell_trade["realized_pnl_pct"] - 0.20) < 1e-5
+
+
+def test_annual_tax_deduction_in_december() -> None:
+    index = pd.bdate_range("2023-11-01", periods=45)
+    close_prices = pd.DataFrame(
+        {
+            "AAA": [100.0] * 20 + [200.0] * 25,
+            "BBB": [100.0] * 20 + [100.0] * 25,
+            "SPY": [100.0] * 45,
+        },
+        index=index,
+    )
+    open_prices = close_prices.copy()
+    volume_prices = pd.DataFrame(
+        {
+            "AAA": [1_000_000.0] * 45,
+            "BBB": [1_000_000.0] * 45,
+            "SPY": [1_000_000.0] * 45,
+        },
+        index=index,
+    )
+
+    backtester = MonthlyBacktester(
+        open_prices=open_prices,
+        close_prices=close_prices,
+        volume_prices=volume_prices,
+        universe=["AAA", "BBB"],
+        transaction_cost_bps=0.0,
+        initial_capital=20_000.0,
+        rebalance_frequency="monthly",
+        rebalance_shift_days=0,
+    )
+    backtester.rebalance_schedule = [
+        (index[18], index[19]),
+        (index[39], index[40]),
+    ]
+
+    selected = ["AAA"]
+    ranking = pd.Series([1.0, 0.0], index=["AAA", "BBB"])
+    current_shares = pd.Series([0, 0], index=["AAA", "BBB"])
+    current_cash = 20_000.0
+
+    current_shares, current_cash, trade_rows, _, rebalance_row = backtester._rebalance_portfolio(
+        strategy=Strategy(name="test_strat", description=""),
+        top_n=1,
+        signal_date=index[18],
+        effective_date=index[19],
+        rebalance_no=1,
+        selected=selected,
+        ranking=ranking,
+        current_shares=current_shares,
+        current_cash=current_cash,
+    )
+
+    selected2 = ["BBB"]
+    ranking2 = pd.Series([0.0, 1.0], index=["AAA", "BBB"])
+
+    current_shares, current_cash, trade_rows2, _, rebalance_row2 = backtester._rebalance_portfolio(
+        strategy=Strategy(name="test_strat", description=""),
+        top_n=1,
+        signal_date=index[39],
+        effective_date=index[40],
+        rebalance_no=2,
+        selected=selected2,
+        ranking=ranking2,
+        current_shares=current_shares,
+        current_cash=current_cash,
+    )
+
+    assert rebalance_row2["tax"] > 0
+    expected_tax = (20_000.0 - 2000.0) * 0.22
+    assert abs(rebalance_row2["tax"] - expected_tax) < 1e-4
+    assert rebalance_row2["cash_after"] == current_cash
+    assert abs(current_cash - 40.0) < 1e-4

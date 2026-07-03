@@ -1,2 +1,2 @@
 strategy,description,rebalance_frequency,top_n,start_date,end_date,initial_capital,total_contributions,total_invested_capital,final_equity,total_return,cagr,annual_volatility,sharpe,max_drawdown,avg_monthly_turnover,rebalance_count
-momentum_3m,Top N stocks by trailing 3-month return,quarterly,5,2020-03-02,2026-07-02,10000.0,0.0,10000.0,139077.0956951344,12.907709569513443,0.5165404385234291,0.35012859871529733,1.4752877668911801,-0.300802147911459,1.6678345786411186,25
+momentum_6m,Top N stocks by trailing 6-month return,quarterly,5,2010-03-02,2026-07-02,10000.0,132000.0,142000.0,2863104.8043581154,57.847756077998,0.2838343370808636,0.32223556764821765,0.8808287029032238,-0.42979072828106557,1.350814127852996,64

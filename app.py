@@ -457,9 +457,8 @@ def render_rebalance_explorer(
     selected_no = int(choices.loc[choices["label"] == selected_label, "rebalance_no"].iloc[0])
 
     summary_row = rebalance_summary[rebalance_summary["rebalance_no"] == selected_no].iloc[0]
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("신호 기준일", str(summary_row["signal_date"]))
-    col2.metric("실행일", str(summary_row["effective_date"]))
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1.metric("실행일", str(summary_row["effective_date"]))
     
     prev_no = selected_no - 1
     prev_rows = rebalance_summary[rebalance_summary["rebalance_no"] == prev_no]
@@ -468,17 +467,29 @@ def render_rebalance_explorer(
     else:
         val_before = float(summary_row["portfolio_value_before_contribution"])
         
-    val_after = float(summary_row["portfolio_value_after"])
-    diff_val = val_after - val_before
-    diff_pct = diff_val / val_before if val_before > 0 else 0.0
+    col2.metric("이전 회차 자산", num(val_before))
     
-    col3.metric("이전 회차 자산", num(val_before))
+    contribution = float(summary_row["cash_contribution"]) if "cash_contribution" in summary_row.index else 0.0
+    col3.metric("추가 납입금", num(contribution))
+    
+    val_after = float(summary_row["portfolio_value_after"])
+    net_profit = val_after - val_before - contribution
+    net_pct = net_profit / (val_before + contribution) if (val_before + contribution) > 0 else 0.0
+    
     col4.metric(
         "이번 회차 자산",
         num(val_after),
-        delta=f"{diff_val:+,.2f} ({diff_pct:+.2%})"
+        delta=f"{net_profit:+,.2f} ({net_pct:+.2%}) (순수익)"
     )
     col5.metric("수수료", num(float(summary_row["fees"])))
+    
+    tax_val = float(summary_row["tax"]) if "tax" in summary_row.index else 0.0
+    col6.metric(
+        "양도소득세",
+        num(tax_val),
+        delta=f"-{num(tax_val)}" if tax_val > 0 else None,
+        delta_color="inverse"
+    )
     st.caption("신호 기준일 종가로 어떤 종목을 교체할지 계산한 뒤, 실제 매매(기존 종목 매도 및 신규 종목 매수)는 그다음 영업일(실행일) 시가에 동시에 체결됩니다. (회전율: " + pct(float(summary_row["turnover"])) + ")")
 
     portfolio = monthly_portfolio_history[monthly_portfolio_history["rebalance_no"] == selected_no].copy()
@@ -917,11 +928,14 @@ def main() -> None:
     if results.get("strategy_names"):
         st.caption("비교한 전략: " + ", ".join(results["strategy_names"]))
 
-    tab_overview, tab_recommend, tab_rebalance, tab_results = st.tabs(
-        ["개요", "추천 및 매수 계획", "리밸런싱 로그", "전체 결과"]
+    active_tab = st.radio(
+        "",
+        options=["개요", "추천 및 매수 계획", "리밸런싱 로그", "전체 결과"],
+        horizontal=True,
+        key="main_rebalance_active_tab"
     )
 
-    with tab_overview:
+    if active_tab == "개요":
         left, right = st.columns([1.35, 1.0])
         with left:
             st.subheader("누적 수익 곡선")
@@ -940,7 +954,7 @@ def main() -> None:
         st.subheader("현재 모델 포트폴리오")
         render_holdings(view_results["current_holdings"])
 
-    with tab_recommend:
+    elif active_tab == "추천 및 매수 계획":
         left, right = st.columns([1.1, 1.0])
         with left:
             st.subheader("최신 추천 종목")
@@ -981,7 +995,7 @@ def main() -> None:
                 key_suffix="recommended",
             )
 
-    with tab_rebalance:
+    elif active_tab == "리밸런싱 로그":
         st.subheader("리밸런싱 실행 내역")
         render_rebalance_explorer(
             view_results["monthly_portfolio_history"],
@@ -989,7 +1003,7 @@ def main() -> None:
             view_results["rebalance_summary"],
         )
 
-    with tab_results:
+    elif active_tab == "전체 결과":
         st.subheader("전체 전략 결과")
         summary_table = results["summary"].copy()
         summary_table["rebalance_frequency"] = summary_table["rebalance_frequency"].map(frequency_label)

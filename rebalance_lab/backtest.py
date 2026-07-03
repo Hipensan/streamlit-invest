@@ -124,6 +124,9 @@ class MonthlyBacktester:
 
         self.rebalance_schedule: list[tuple[pd.Timestamp, pd.Timestamp]] = []
         self.average_costs: dict[str, float] = {}
+        self.usd_krw_rate = 1300.0
+        self.annual_realized_pnl = 0.0
+        self.current_year = None
         self._refresh_rebalance_schedule()
 
     def _refresh_rebalance_schedule(self) -> None:
@@ -505,12 +508,57 @@ class MonthlyBacktester:
         current_cash: float,
         cash_contribution: float = 0.0,
     ) -> tuple[pd.Series, float, list[dict[str, object]], list[dict[str, object]], dict[str, object]]:
+        if self.current_year is None or signal_date.year != self.current_year:
+            self.annual_realized_pnl = 0.0
+            self.current_year = signal_date.year
+
+        is_last_of_year = True
+        for next_sig, next_eff in self.rebalance_schedule[rebalance_no:]:
+            if next_sig.year == signal_date.year:
+                is_last_of_year = False
+                break
+
         execution_price_row = self.trade_prices.loc[effective_date].fillna(0.0)
         close_price_row = self.close_prices.loc[effective_date, self.universe].fillna(0.0)
         portfolio_value_before_contribution = float((current_shares * execution_price_row).sum() + current_cash)
         current_cash = float(current_cash + cash_contribution)
         portfolio_value_before = float((current_shares * execution_price_row).sum() + current_cash)
         target_weights = self._build_target_weights(strategy=strategy, selected=selected, signal_date=signal_date)
+
+        # 연도 최종 거래일 세금 가예측 (Pass 1)
+        estimated_tax = 0.0
+        if is_last_of_year:
+            temp_target_shares, _, _, _, _, _, _, _ = self._build_target_shares(
+                selected=selected,
+                target_weights=target_weights,
+                price_row=execution_price_row,
+                total_equity=portfolio_value_before,
+                current_shares=current_shares,
+                current_cash=current_cash,
+            )
+            # 임시 매도로 인한 실현손익 계산
+            temp_realized_pnl = 0.0
+            temp_share_delta = temp_target_shares - current_shares
+            for ticker in temp_share_delta.index:
+                delta = int(temp_share_delta.at[ticker])
+                if delta < 0:
+                    shares = abs(delta)
+                    price = float(execution_price_row.at[ticker])
+                    notional = shares * price
+                    prev_cost = float(self.average_costs.get(ticker, 0.0))
+                    if prev_cost > 0:
+                        temp_realized_pnl += (notional - (shares * prev_cost))
+            
+            estimated_annual_pnl = self.annual_realized_pnl + temp_realized_pnl
+            tax_free_limit = 2000.0
+            if estimated_annual_pnl > tax_free_limit:
+                estimated_tax = (estimated_annual_pnl - tax_free_limit) * 0.22
+
+        # 세금 선공제 조정 (Pass 2)
+        tax = estimated_tax
+        equity_for_allocation = portfolio_value_before - tax
+        current_cash_for_allocation = current_cash - tax
+
         (
             target_shares,
             target_weights,
@@ -524,9 +572,9 @@ class MonthlyBacktester:
             selected=selected,
             target_weights=target_weights,
             price_row=execution_price_row,
-            total_equity=portfolio_value_before,
+            total_equity=equity_for_allocation,
             current_shares=current_shares,
-            current_cash=current_cash,
+            current_cash=current_cash_for_allocation,
         )
         traded_notional = buy_notional + sell_notional
         turnover = traded_notional / portfolio_value_before if portfolio_value_before > 0 else 0.0
@@ -572,6 +620,7 @@ class MonthlyBacktester:
                     purchase_notional = shares * prev_cost
                     realized_pnl = notional - purchase_notional
                     realized_pnl_pct = realized_pnl / purchase_notional if purchase_notional > 0 else 0.0
+                    self.annual_realized_pnl += realized_pnl
 
                 if post_shares == 0:
                     self.average_costs[ticker] = 0.0
@@ -609,6 +658,11 @@ class MonthlyBacktester:
 
         holdings_value = (target_shares * close_price_row).astype(float)
         total_equity = float(holdings_value.sum() + cash_after)
+        
+        # 연간 세금 결산 후 실현손익 리셋
+        if is_last_of_year:
+            self.annual_realized_pnl = 0.0
+
         portfolio_rows: list[dict[str, object]] = []
         for ticker in target_shares[target_shares > 0].index:
             market_value = float(holdings_value.at[ticker])
@@ -679,6 +733,7 @@ class MonthlyBacktester:
             "target_turnover_threshold": strategy.min_turnover,
             "skipped_by_turnover": skipped_by_turnover,
             "cash_after": cash_after,
+            "tax": tax,
         }
         return target_shares, cash_after, trade_rows, portfolio_rows, rebalance_row
 
@@ -748,6 +803,8 @@ class MonthlyBacktester:
 
     def run(self, strategy: Strategy, top_n: int) -> StrategyRun:
         self.average_costs = {ticker: 0.0 for ticker in self.universe}
+        self.annual_realized_pnl = 0.0
+        self.current_year = None
         (
             shares_history,
             cash_series,
