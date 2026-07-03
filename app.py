@@ -839,6 +839,8 @@ def main() -> None:
             st.session_state["results"] = existing
 
     if run_clicked:
+        if "selected_combination_label" in st.session_state:
+            del st.session_state["selected_combination_label"]
         try:
             top_n_values = parse_top_n_text(top_n_text)
             rebalance_frequencies = parse_frequency_text(frequency_text)
@@ -865,6 +867,8 @@ def main() -> None:
             st.error(f"백테스트 실행 중 오류가 발생했습니다: {exc}")
 
     if load_clicked:
+        if "selected_combination_label" in st.session_state:
+            del st.session_state["selected_combination_label"]
         existing = load_existing_outputs()
         if existing is None:
             st.warning("저장된 결과가 없습니다. 먼저 백테스트를 실행하세요.")
@@ -894,11 +898,21 @@ def main() -> None:
             for row in results["summary"].itertuples(index=False)
         ]
         default_label = build_run_label(best_row["strategy"], best_row["rebalance_frequency"], best_row["top_n"])
+        if "selected_combination_label" not in st.session_state or st.session_state["selected_combination_label"] not in labels:
+            st.session_state["selected_combination_label"] = default_label
+
+        try:
+            default_idx = labels.index(st.session_state["selected_combination_label"])
+        except ValueError:
+            default_idx = 0
+
         selected_label = st.selectbox(
             "보고 싶은 조합 선택",
             labels,
-            index=labels.index(default_label) if default_label in labels else 0,
+            index=default_idx,
+            key="selected_combination_label_widget",
         )
+        st.session_state["selected_combination_label"] = selected_label
         selected_row, selected_run = resolve_selected_run(results, selected_label)
         view_results = materialize_selected_results(results, selected_row, selected_run)
         st.caption("선택한 조합 기준으로 아래 포트폴리오, 추천, 리밸런싱 로그가 갱신됩니다.")
