@@ -444,6 +444,7 @@ def render_rebalance_explorer(
     monthly_portfolio_history: pd.DataFrame,
     trade_log: pd.DataFrame,
     rebalance_summary: pd.DataFrame,
+    key_suffix: str = "",
 ) -> None:
     if rebalance_summary.empty:
         st.info("리밸런싱 내역이 없습니다.")
@@ -453,7 +454,12 @@ def render_rebalance_explorer(
         rebalance_summary[["rebalance_no", "effective_date", "signal_date"]]
         .assign(label=lambda df: df["rebalance_no"].astype(str) + " | " + df["effective_date"])
     )
-    selected_label = st.selectbox("리밸런싱 회차", choices["label"].tolist(), index=len(choices) - 1)
+    selected_label = st.selectbox(
+        "리밸런싱 회차",
+        choices["label"].tolist(),
+        index=len(choices) - 1,
+        key=f"rebalance_no_selectbox_{key_suffix}",
+    )
     selected_no = int(choices.loc[choices["label"] == selected_label, "rebalance_no"].iloc[0])
 
     summary_row = rebalance_summary[rebalance_summary["rebalance_no"] == selected_no].iloc[0]
@@ -1001,6 +1007,7 @@ def main() -> None:
             view_results["monthly_portfolio_history"],
             view_results["trade_log"],
             view_results["rebalance_summary"],
+            key_suffix=f"{selected_row['strategy']}_{selected_row['rebalance_frequency']}_{selected_row['top_n']}",
         )
 
     elif active_tab == "전체 결과":
