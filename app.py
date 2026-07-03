@@ -534,10 +534,10 @@ def render_recommendations(latest_recommendations: pd.DataFrame) -> None:
             f"신호 기준일: {recommendations['as_of'].iloc[0]} 종가 기준으로 종목을 평가합니다. "
             "실제 포트폴리오 교체 주문(매도 및 매수)은 다음 거래일 시가에 동시에 집행됩니다."
         )
-    display = recommendations[["ticker", "score", "latest_price", "ret_1m", "ret_6m", "ret_12m", "selected"]].copy()
+    display = recommendations[["ticker", "score", "latest_price", "ret_1m", "ret_3m", "ret_6m", "ret_12m", "selected"]].copy()
     display["score"] = display["score"].map(lambda x: f"{x:,.4f}")
     display["latest_price"] = display["latest_price"].map(lambda x: f"{x:,.2f}")
-    for column in ["ret_1m", "ret_6m", "ret_12m"]:
+    for column in ["ret_1m", "ret_3m", "ret_6m", "ret_12m"]:
         display[column] = display[column].map(pct)
     display = display.rename(
         columns={
@@ -545,6 +545,7 @@ def render_recommendations(latest_recommendations: pd.DataFrame) -> None:
             "score": "점수",
             "latest_price": "기준종가",
             "ret_1m": "1개월",
+            "ret_3m": "3개월",
             "ret_6m": "6개월",
             "ret_12m": "12개월",
             "selected": "현재선정",

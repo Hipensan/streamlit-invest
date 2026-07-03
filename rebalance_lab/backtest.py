@@ -798,6 +798,7 @@ class MonthlyBacktester:
             return latest_date, frame
         frame["latest_price"] = self.close_prices.loc[latest_date, frame["ticker"]].values
         frame["ret_1m"] = self.ret_21.loc[latest_date, frame["ticker"]].values
+        frame["ret_3m"] = self.ret_63.loc[latest_date, frame["ticker"]].values
         frame["ret_6m"] = self.ret_126.loc[latest_date, frame["ticker"]].values
         frame["ret_12m"] = self.ret_252.loc[latest_date, frame["ticker"]].values
         frame["vol_3m"] = self.vol_63.loc[latest_date, frame["ticker"]].values

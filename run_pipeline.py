@@ -230,7 +230,7 @@ def main() -> None:
         print(
             "  "
             f"{row.ticker}: score={row.score:.4f}, price={row.latest_price:.2f}, "
-            f"1m={row.ret_1m:.2%}, 6m={row.ret_6m:.2%}, 12m={row.ret_12m:.2%}"
+            f"1m={row.ret_1m:.2%}, 3m={row.ret_3m:.2%}, 6m={row.ret_6m:.2%}, 12m={row.ret_12m:.2%}"
         )
     print()
     print("Saved files:")
@@ -304,7 +304,7 @@ def write_report(
     for row in latest_recommendations.itertuples(index=False):
         lines.append(
             f"- {row.ticker}: score {row.score:.4f}, price {row.latest_price:.2f}, "
-            f"1m {row.ret_1m:.2%}, 6m {row.ret_6m:.2%}, 12m {row.ret_12m:.2%}"
+            f"1m {row.ret_1m:.2%}, 3m {row.ret_3m:.2%}, 6m {row.ret_6m:.2%}, 12m {row.ret_12m:.2%}"
         )
     lines.extend(
         [
