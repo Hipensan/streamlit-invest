@@ -51,14 +51,12 @@ def test_monthly_backtester_runs_on_synthetic_prices() -> None:
     assert not backtester.latest_holdings(run).empty
     assert not run.trade_log.empty
     assert not run.portfolio_history.empty
-    assert not run.daily_signals.empty
     assert (run.shares_history.fillna(0.0) % 1 == 0).all().all()
     assert "execution_price" in run.portfolio_history.columns
     assert run.trade_log["price"].notna().all()
-    assert {"BUY", "SELL", "HOLD", "ADD", "TRIM"}.intersection(set(run.daily_signals["action"].unique()))
 
 
-def test_volume_confirmed_momentum_prefers_supported_liquid_names() -> None:
+def test_high_liquidity_strategy_prefers_highly_liquid_names() -> None:
     index = pd.bdate_range("2023-01-02", periods=320)
     close_prices = pd.DataFrame(
         {
@@ -90,7 +88,7 @@ def test_volume_confirmed_momentum_prefers_supported_liquid_names() -> None:
     )
 
     selected, ranking = backtester.select_target_tickers(
-        Strategy(name="volume_confirmed_momentum", description="synthetic volume strategy"),
+        Strategy(name="high_liquidity", description="synthetic volume strategy"),
         date=index[-2],
         top_n=1,
     )
@@ -277,10 +275,10 @@ def test_evaluate_strategies_can_filter_selected_strategies() -> None:
         backtester,
         top_n_values=[2],
         rebalance_frequencies=["monthly"],
-        strategy_names=["momentum_6m", "blend_momentum"],
+        strategy_names=["momentum_6m", "low_volatility"],
     )
 
-    assert [run.strategy.name for run in runs] == ["momentum_6m", "blend_momentum"]
+    assert [run.strategy.name for run in runs] == ["momentum_6m", "low_volatility"]
 
 
 def test_rebalance_contribution_is_added_to_cash_flow() -> None:
@@ -324,47 +322,6 @@ def test_rebalance_contribution_is_added_to_cash_flow() -> None:
     assert run.metrics.total_contributions == expected_contributions
     assert run.metrics.total_invested_capital == 10_000.0 + expected_contributions
     assert run.metrics.final_equity > run.metrics.total_invested_capital
-
-
-def test_daily_signal_follow_is_distinct_from_quarterly_backtest() -> None:
-    index = pd.bdate_range("2022-01-03", periods=420)
-    close_prices = pd.DataFrame(
-        {
-            "AAA": 100 + np.linspace(0, 60, len(index)) + 10 * np.sin(np.linspace(0, 20, len(index))),
-            "BBB": 100 + np.linspace(0, 45, len(index)) + 14 * np.sin(np.linspace(1, 30, len(index))),
-            "CCC": 100 + np.linspace(0, 25, len(index)) - 8 * np.sin(np.linspace(0, 18, len(index))),
-            "SPY": 100 + np.linspace(0, 35, len(index)),
-        },
-        index=index,
-    )
-    open_prices = close_prices * 0.995
-    volume_prices = pd.DataFrame(
-        {
-            "AAA": np.full(len(index), 1_200_000.0),
-            "BBB": np.full(len(index), 1_000_000.0),
-            "CCC": np.full(len(index), 900_000.0),
-            "SPY": np.full(len(index), 2_500_000.0),
-        },
-        index=index,
-    )
-    strategy = Strategy(name="momentum_6m", description="synthetic test")
-    backtester = MonthlyBacktester(
-        open_prices=open_prices,
-        close_prices=close_prices,
-        volume_prices=volume_prices,
-        universe=["AAA", "BBB", "CCC"],
-        transaction_cost_bps=0.0,
-        initial_capital=10_000.0,
-        rebalance_frequency="quarterly",
-        rebalance_shift_days=0,
-    )
-
-    quarterly_run = backtester.run(strategy, top_n=2)
-    daily_follow = backtester.simulate_daily_signal_follow(strategy, top_n=2)
-
-    assert daily_follow.rebalance_count >= quarterly_run.metrics.rebalance_count
-    assert abs(daily_follow.final_equity - quarterly_run.metrics.final_equity) > 1e-6
-    assert not daily_follow.daily_signals.empty
 
 
 def test_purchase_plan_uses_integer_shares_and_leaves_cash() -> None:
@@ -499,3 +456,223 @@ def test_price_cache_refreshes_when_cached_bundle_has_no_volume(monkeypatch) -> 
         cache_path.unlink()
     if cache_dir.exists():
         cache_dir.rmdir()
+
+
+def test_risk_parity_allocation() -> None:
+    index = pd.bdate_range("2023-01-02", periods=65)
+    close_prices = pd.DataFrame(
+        {
+            "AAA": np.linspace(100, 150, len(index)),
+            "BBB": np.linspace(100, 110, len(index)) + np.sin(np.arange(len(index))),
+            "CCC": np.linspace(100, 120, len(index)),
+            "SPY": np.linspace(100, 130, len(index)),
+        },
+        index=index,
+    )
+    open_prices = close_prices * 0.99
+
+    backtester = MonthlyBacktester(
+        open_prices=open_prices,
+        close_prices=close_prices,
+        volume_prices=None,
+        universe=["AAA", "BBB", "CCC"],
+        transaction_cost_bps=0.0,
+        initial_capital=10_000.0,
+        rebalance_frequency="monthly",
+        rebalance_shift_days=0,
+        allocation_mode_override="risk_parity",
+    )
+
+    weights = backtester._build_target_weights(
+        Strategy(name="momentum_6m", description="test"),
+        selected=["AAA", "BBB"],
+        signal_date=index[-1],
+    )
+
+    assert abs(weights.sum() - 1.0) < 1e-9
+    # 변동성이 더 작은 AAA의 비중이 더 크게 배분되어야 함
+    assert weights["AAA"] > weights["BBB"]
+
+
+def test_mean_variance_allocation() -> None:
+    index = pd.bdate_range("2023-01-02", periods=130)
+    close_prices = pd.DataFrame(
+        {
+            "AAA": np.linspace(100, 200, len(index)),
+            "BBB": np.linspace(100, 105, len(index)),
+            "CCC": np.linspace(100, 110, len(index)),
+            "SPY": np.linspace(100, 120, len(index)),
+        },
+        index=index,
+    )
+    open_prices = close_prices * 0.99
+
+    backtester = MonthlyBacktester(
+        open_prices=open_prices,
+        close_prices=close_prices,
+        volume_prices=None,
+        universe=["AAA", "BBB", "CCC"],
+        transaction_cost_bps=0.0,
+        initial_capital=10_000.0,
+        rebalance_frequency="monthly",
+        rebalance_shift_days=0,
+        allocation_mode_override="mean_variance",
+    )
+
+    weights = backtester._build_target_weights(
+        Strategy(name="momentum_6m", description="test"),
+        selected=["AAA", "BBB", "CCC"],
+        signal_date=index[-1],
+    )
+
+    assert abs(weights.sum() - 1.0) < 1e-9
+    assert weights["AAA"] <= 0.40001
+
+
+def test_hybrid_strategy_blending() -> None:
+    index = pd.bdate_range("2023-01-02", periods=130)
+    close_prices = pd.DataFrame(
+        {
+            "AAA": np.linspace(100, 150, len(index)),
+            "BBB": np.linspace(100, 120, len(index)),
+            "CCC": np.linspace(100, 105, len(index)),
+            "SPY": np.linspace(100, 125, len(index)),
+        },
+        index=index,
+    )
+    open_prices = close_prices * 0.99
+
+    hybrid_w = {"momentum_3m": 0.5, "momentum_12m": 0.5}
+
+    backtester = MonthlyBacktester(
+        open_prices=open_prices,
+        close_prices=close_prices,
+        volume_prices=None,
+        universe=["AAA", "BBB", "CCC"],
+        transaction_cost_bps=0.0,
+        initial_capital=10_000.0,
+        rebalance_frequency="monthly",
+        rebalance_shift_days=0,
+        hybrid_weights=hybrid_w,
+    )
+
+    score = backtester.score_strategy("hybrid_strategy", index[-1])
+    assert not score.empty
+    assert "AAA" in score.index
+    assert "BBB" in score.index
+
+
+def test_non_momentum_strategies_smoke() -> None:
+    index = pd.bdate_range("2023-01-02", periods=130)
+    close_prices = pd.DataFrame(
+        {
+            "AAA": np.linspace(100, 150, len(index)),
+            "BBB": np.linspace(100, 110, len(index)) + np.sin(np.arange(len(index))),
+            "CCC": np.linspace(100, 120, len(index)),
+            "SPY": np.linspace(100, 130, len(index)),
+        },
+        index=index,
+    )
+    open_prices = close_prices * 0.99
+    volume_prices = pd.DataFrame(
+        {
+            "AAA": np.full(len(index), 1_000_000.0),
+            "BBB": np.full(len(index), 1_200_000.0),
+            "CCC": np.full(len(index), 800_000.0),
+            "SPY": np.full(len(index), 3_000_000.0),
+        },
+        index=index,
+    )
+
+    backtester = MonthlyBacktester(
+        open_prices=open_prices,
+        close_prices=close_prices,
+        volume_prices=volume_prices,
+        universe=["AAA", "BBB", "CCC"],
+        transaction_cost_bps=0.0,
+        initial_capital=10_000.0,
+        rebalance_frequency="monthly",
+        rebalance_shift_days=0,
+    )
+
+    for strat_name in ["low_volatility", "mean_reversion_rsi", "high_liquidity", "min_drawdown"]:
+        selected, ranking = backtester.select_target_tickers(
+            Strategy(name=strat_name, description="non-momentum factor test"),
+            date=index[-1],
+            top_n=2,
+        )
+        assert len(selected) == 2
+        assert not ranking.empty
+
+
+def test_rebalance_pnl_tracking() -> None:
+    index = pd.bdate_range("2023-01-02", periods=45)
+    close_prices = pd.DataFrame(
+        {
+            "AAA": [100.0] * 30 + [120.0] * 15,
+            "BBB": [100.0] * 30 + [80.0] * 15,
+            "SPY": [100.0] * 45,
+        },
+        index=index,
+    )
+    open_prices = close_prices.copy()
+    volume_prices = pd.DataFrame(
+        {
+            "AAA": [1_000_000.0] * 45,
+            "BBB": [1_000_000.0] * 45,
+            "SPY": [1_000_000.0] * 45,
+        },
+        index=index,
+    )
+
+    backtester = MonthlyBacktester(
+        open_prices=open_prices,
+        close_prices=close_prices,
+        volume_prices=volume_prices,
+        universe=["AAA", "BBB"],
+        transaction_cost_bps=0.0,
+        initial_capital=10_000.0,
+        rebalance_frequency="monthly",
+        rebalance_shift_days=0,
+    )
+
+    selected = ["AAA"]
+    ranking = pd.Series([1.0, 0.0], index=["AAA", "BBB"])
+    current_shares = pd.Series([0, 0], index=["AAA", "BBB"])
+    current_cash = 10_000.0
+
+    current_shares, current_cash, trade_rows, _, rebalance_row = backtester._rebalance_portfolio(
+        strategy=Strategy(name="test_strat", description=""),
+        top_n=1,
+        signal_date=index[19],
+        effective_date=index[20],
+        rebalance_no=1,
+        selected=selected,
+        ranking=ranking,
+        current_shares=current_shares,
+        current_cash=current_cash,
+    )
+
+    assert backtester.average_costs["AAA"] == 100.0
+    assert pd.isna(trade_rows[0]["realized_pnl"])
+
+    selected2 = ["BBB"]
+    ranking2 = pd.Series([0.0, 1.0], index=["AAA", "BBB"])
+    current_shares, current_cash, trade_rows2, _, rebalance_row2 = backtester._rebalance_portfolio(
+        strategy=Strategy(name="test_strat", description=""),
+        top_n=1,
+        signal_date=index[39],
+        effective_date=index[40],
+        rebalance_no=2,
+        selected=selected2,
+        ranking=ranking2,
+        current_shares=current_shares,
+        current_cash=current_cash,
+    )
+
+    sell_trade = [t for t in trade_rows2 if t["ticker"] == "AAA" and t["action"] == "SELL"][0]
+    assert sell_trade["price"] == 120.0
+    assert sell_trade["purchase_price"] == 100.0
+    expected_shares = sell_trade["shares"]
+    assert sell_trade["realized_pnl"] == expected_shares * 20.0
+    assert abs(sell_trade["realized_pnl_pct"] - 0.20) < 1e-5

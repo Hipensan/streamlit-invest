@@ -71,6 +71,17 @@ def parse_args() -> argparse.Namespace:
         default=30,
         help="Number of days to shift rebalance date earlier (default: 30)",
     )
+    parser.add_argument(
+        "--allocation-override",
+        default=None,
+        choices=["equal_weight", "inverse_volatility", "risk_parity", "mean_variance"],
+        help="Override all strategies' asset allocation method",
+    )
+    parser.add_argument(
+        "--hybrid-weights",
+        default=None,
+        help="Comma-separated strategy:weight values for hybrid_strategy, e.g. 'momentum_12m:0.5,risk_adjusted_momentum:0.5'",
+    )
     return parser.parse_args()
 
 
@@ -105,10 +116,29 @@ def parse_rebalance_frequencies(args: argparse.Namespace) -> list[str]:
     return unique_values
 
 
+def parse_hybrid_weights(raw: str | None) -> dict[str, float]:
+    weights: dict[str, float] = {}
+    if not raw:
+        return weights
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            continue
+        key, val = part.split(":", 1)
+        try:
+            weights[key.strip()] = float(val.strip())
+        except ValueError:
+            pass
+    return weights
+
+
 def parse_strategy_names(args: argparse.Namespace) -> list[str] | None:
     if args.strategies is None:
         return None
     supported = {strategy.name for strategy in build_strategy_library()}
+    supported.add("hybrid_strategy")
     values = [value.strip() for value in args.strategies.split(",") if value.strip()]
     unique_values = []
     for value in values:
@@ -163,6 +193,8 @@ def main() -> None:
         rebalance_contribution=args.rebalance_contribution,
         rebalance_shift_days=args.rebalance_shift_days,
         non_trading_day_adjustment="prior",
+        allocation_mode_override=args.allocation_override,
+        hybrid_weights=parse_hybrid_weights(args.hybrid_weights),
     )
     runs = evaluate_strategies(
         backtester,
@@ -309,10 +341,6 @@ def write_report(
     lines.extend(
         [
             "",
-            "## Daily Action Signals",
-            "",
-            "- outputs/daily_signals.csv: daily buy/add/trim/sell guidance based on the selected strategy",
-            "",
             "## Exported Files",
             "",
             "- outputs/backtest_summary.csv: all strategy x top-N combinations",
@@ -322,7 +350,6 @@ def write_report(
             "- outputs/monthly_portfolio_history.csv: portfolio after each rebalance",
             "- outputs/trade_log.csv: every buy and sell with prices",
             "- outputs/rebalance_summary.csv: one row per rebalance event",
-            "- outputs/daily_signals.csv: daily action guidance and target-weight gaps",
         ]
     )
     report_path = output_dir / "latest_report.md"

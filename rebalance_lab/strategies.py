@@ -63,10 +63,6 @@ def build_strategy_library() -> list[Strategy]:
             description="Top N by 12-month return divided by 3-month volatility",
         ),
         Strategy(
-            name="trend_filtered_momentum",
-            description="Hold top N 12-month momentum names only when SPY and stock are above 200DMA",
-        ),
-        Strategy(
             name="low_vol_momentum",
             description="Top N by 6-month return penalized by 3-month volatility",
         ),
@@ -75,25 +71,25 @@ def build_strategy_library() -> list[Strategy]:
             description="Top N by proximity to 52-week highs blended with 6-month momentum",
         ),
         Strategy(
-            name="blend_momentum",
-            description="Top N by blended 6m/12m momentum and lower volatility",
-        ),
-        Strategy(
-            name="volume_confirmed_momentum",
-            description="Top N by 6-month momentum only when supported by stronger-than-average volume",
-            allocation_mode="inverse_volatility",
-            min_turnover=0.05,
-        ),
-        Strategy(
-            name="volume_adjusted_momentum",
-            description="Top N by 6-month momentum boosted by relative volume and penalized by volatility",
-            allocation_mode="inverse_volatility",
-            min_turnover=0.05,
-        ),
-        Strategy(
             name="drawdown_filtered_momentum",
             description="Top N by blended momentum while avoiding names in deeper 6-month drawdowns",
             allocation_mode="inverse_volatility",
             min_turnover=0.04,
+        ),
+        Strategy(
+            name="low_volatility",
+            description="Top N stocks by trailing 3-month volatility (lowest vol first)",
+        ),
+        Strategy(
+            name="mean_reversion_rsi",
+            description="Top N stocks by trailing 14-day RSI (most oversold first)",
+        ),
+        Strategy(
+            name="high_liquidity",
+            description="Top N stocks by trailing 1-month average daily trading volume (highest value first)",
+        ),
+        Strategy(
+            name="min_drawdown",
+            description="Top N stocks by trailing 6-month maximum drawdown (smallest drawdown first)",
         ),
     ]

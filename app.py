@@ -19,6 +19,24 @@ OUTPUT_DIR = PROJECT_ROOT / "outputs"
 CACHE_DIR = OUTPUT_DIR / "cache"
 
 
+@st.cache_resource(show_spinner="S&P 500 종목 구성을 분석하고 있습니다...")
+def cached_fetch_sp500_snapshot():
+    return fetch_sp500_snapshot()
+
+
+@st.cache_resource(show_spinner="주가 가격 정보를 로드하고 있습니다...")
+def cached_load_or_refresh_price_cache(tickers, start, end, cache_path, force_refresh):
+    if force_refresh:
+        st.cache_resource.clear()
+    return load_or_refresh_price_cache(
+        tickers=tickers,
+        start=start,
+        end=end,
+        cache_path=cache_path,
+        force_refresh=force_refresh,
+    )
+
+
 def ensure_rebalance_frequency_column(frame: pd.DataFrame) -> pd.DataFrame:
     normalized = frame.copy()
     if "rebalance_frequency" not in normalized.columns:
@@ -78,12 +96,14 @@ def run_backtest(
     transaction_cost_bps: float,
     force_refresh: bool,
     rebalance_shift_days: int,
+    allocation_override: str | None = None,
+    hybrid_weights: dict[str, float] | None = None,
 ) -> dict[str, object]:
-    universe_snapshot = fetch_sp500_snapshot()
+    universe_snapshot = cached_fetch_sp500_snapshot()
     persist_universe_snapshot(universe_snapshot, OUTPUT_DIR / "sp500_snapshot.csv")
 
     tickers = sorted(set(universe_snapshot.tickers + CONTROL_TICKERS))
-    price_bundle = load_or_refresh_price_cache(
+    price_bundle = cached_load_or_refresh_price_cache(
         tickers=tickers,
         start=start,
         end=end,
@@ -111,6 +131,8 @@ def run_backtest(
         rebalance_contribution=rebalance_contribution,
         rebalance_shift_days=rebalance_shift_days,
         non_trading_day_adjustment="prior",
+        allocation_mode_override=allocation_override,
+        hybrid_weights=hybrid_weights,
     )
     runs = evaluate_strategies(
         backtester,
@@ -293,22 +315,6 @@ def materialize_selected_results(results: dict[str, object], selected_row: pd.Se
     selected["monthly_portfolio_history"] = selected_run.portfolio_history
     selected["trade_log"] = selected_run.trade_log
     selected["rebalance_summary"] = selected_run.rebalance_summary
-    daily_follow = backtester.simulate_daily_signal_follow(selected_run.strategy, selected_run.top_n)
-    selected["daily_signals"] = daily_follow.daily_signals
-    selected["daily_action_summary"] = pd.DataFrame(
-        [
-            {
-                "initial_capital": daily_follow.initial_capital,
-                "final_equity": daily_follow.final_equity,
-                "total_return": daily_follow.total_return,
-                "cagr": daily_follow.cagr,
-                "rebalance_count": daily_follow.rebalance_count,
-            }
-        ]
-    )
-    selected["daily_action_equity"] = pd.DataFrame(
-        {"date": daily_follow.equity_curve.index, "equity": daily_follow.equity_curve.values}
-    )
     return selected
 
 
@@ -402,7 +408,7 @@ def render_equity_chart(equity_curves: pd.DataFrame, summary: pd.DataFrame) -> N
         template="plotly_white",
     )
     fig.update_layout(height=430, margin=dict(l=10, r=10, t=10, b=10))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key="plotly_equity_curve")
 
 
 def render_holdings(current_holdings: pd.DataFrame) -> None:
@@ -419,7 +425,7 @@ def render_holdings(current_holdings: pd.DataFrame) -> None:
         template="plotly_white",
     )
     fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key="plotly_holdings_bar")
 
     display = stocks[["ticker", "shares", "latest_price", "market_value", "weight"]].copy()
     display.columns = ["종목", "보유주수", "최신종가", "평가금액", "비중"]
@@ -451,19 +457,36 @@ def render_rebalance_explorer(
     selected_no = int(choices.loc[choices["label"] == selected_label, "rebalance_no"].iloc[0])
 
     summary_row = rebalance_summary[rebalance_summary["rebalance_no"] == selected_no].iloc[0]
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("신호 기준일", str(summary_row["signal_date"]))
     col2.metric("실행일", str(summary_row["effective_date"]))
-    col3.metric("회전율", pct(float(summary_row["turnover"])))
-    col4.metric("수수료", num(float(summary_row["fees"])))
-    st.caption("신호 기준일 종가로 어떤 종목을 교체할지 계산한 뒤, 실제 매매(기존 종목 매도 및 신규 종목 매수)는 그다음 영업일(실행일) 시가에 동시에 체결됩니다.")
+    
+    prev_no = selected_no - 1
+    prev_rows = rebalance_summary[rebalance_summary["rebalance_no"] == prev_no]
+    if not prev_rows.empty:
+        val_before = float(prev_rows.iloc[0]["portfolio_value_after"])
+    else:
+        val_before = float(summary_row["portfolio_value_before_contribution"])
+        
+    val_after = float(summary_row["portfolio_value_after"])
+    diff_val = val_after - val_before
+    diff_pct = diff_val / val_before if val_before > 0 else 0.0
+    
+    col3.metric("이전 회차 자산", num(val_before))
+    col4.metric(
+        "이번 회차 자산",
+        num(val_after),
+        delta=f"{diff_val:+,.2f} ({diff_pct:+.2%})"
+    )
+    col5.metric("수수료", num(float(summary_row["fees"])))
+    st.caption("신호 기준일 종가로 어떤 종목을 교체할지 계산한 뒤, 실제 매매(기존 종목 매도 및 신규 종목 매수)는 그다음 영업일(실행일) 시가에 동시에 체결됩니다. (회전율: " + pct(float(summary_row["turnover"])) + ")")
 
     portfolio = monthly_portfolio_history[monthly_portfolio_history["rebalance_no"] == selected_no].copy()
     trades = trade_log[trade_log["rebalance_no"] == selected_no].copy()
     if "execution_price" not in portfolio.columns:
         portfolio["execution_price"] = pd.NA
 
-    left, right = st.columns([1.2, 1.0])
+    left, right = st.columns([1.1, 1.1])
     with left:
         display_portfolio = portfolio.copy()
         display_portfolio["price"] = display_portfolio["price"].map(lambda x: f"{x:,.2f}")
@@ -499,6 +522,23 @@ def render_rebalance_explorer(
             st.info("이 회차에는 거래가 없습니다.")
         else:
             display_trades = trades.copy()
+            if "purchase_price" not in display_trades.columns:
+                display_trades["purchase_price"] = np.nan
+            if "realized_pnl" not in display_trades.columns:
+                display_trades["realized_pnl"] = np.nan
+            if "realized_pnl_pct" not in display_trades.columns:
+                display_trades["realized_pnl_pct"] = np.nan
+
+            display_trades["purchase_price"] = display_trades["purchase_price"].map(
+                lambda x: "" if pd.isna(x) else f"{float(x):,.2f}"
+            )
+            display_trades["realized_pnl"] = display_trades["realized_pnl"].map(
+                lambda x: "" if pd.isna(x) else f"{float(x):+,.2f}"
+            )
+            display_trades["realized_pnl_pct"] = display_trades["realized_pnl_pct"].map(
+                lambda x: "" if pd.isna(x) else f"{float(x):+.2%}"
+            )
+
             display_trades["price"] = display_trades["price"].map(lambda x: f"{x:,.2f}")
             display_trades["notional"] = display_trades["notional"].map(num)
             display_trades["fee"] = display_trades["fee"].map(num)
@@ -508,17 +548,37 @@ def render_rebalance_explorer(
                     "ticker": "종목",
                     "shares": "주수",
                     "price": "체결시가",
+                    "purchase_price": "매수단가",
                     "notional": "거래금액",
+                    "realized_pnl": "실현손익",
+                    "realized_pnl_pct": "수익률",
                     "fee": "수수료",
                     "pre_shares": "이전보유",
                     "post_shares": "변경후보유",
                     "rank_on_signal": "신호순위",
                 }
             )
+
+            def style_pnl(val):
+                if pd.isna(val) or val == "":
+                    return ""
+                try:
+                    val_str = str(val).replace(",", "").replace("+", "").replace("%", "")
+                    val_float = float(val_str)
+                    if val_float > 0:
+                        return "color: #d93838; font-weight: bold;"  # 빨간색
+                    elif val_float < 0:
+                        return "color: #1c62b9; font-weight: bold;"  # 파란색
+                except ValueError:
+                    pass
+                return ""
+
+            styled_trades = display_trades[
+                ["구분", "종목", "주수", "체결시가", "매수단가", "거래금액", "실현손익", "수익률", "수수료"]
+            ].style.map(style_pnl, subset=["실현손익", "수익률"])
+
             st.dataframe(
-                display_trades[
-                    ["구분", "종목", "주수", "체결시가", "거래금액", "수수료", "이전보유", "변경후보유", "신호순위"]
-                ],
+                styled_trades,
                 use_container_width=True,
                 hide_index=True,
             )
@@ -579,6 +639,7 @@ def render_buy_plan_section(
     budget: float,
     title: str,
     caption: str,
+    key_suffix: str,
 ) -> None:
     st.markdown(f"**{title}**")
     st.caption(caption)
@@ -603,7 +664,7 @@ def render_buy_plan_section(
         template="plotly_white",
     )
     fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=f"plotly_rebalance_plan_bar_{key_suffix}")
 
     display = plan.copy()
     for column in ["target_weight", "actual_weight", "weight_gap"]:
@@ -632,115 +693,7 @@ def render_buy_plan_section(
     st.caption("소수점 주식은 허용하지 않으므로 정수 주수로만 계산합니다. 남는 현금은 깔끔하게 배분되지 않은 금액입니다.")
 
 
-def render_daily_actions(daily_signals: pd.DataFrame) -> None:
-    if daily_signals.empty:
-        st.info("일별 액션 데이터가 없습니다.")
-        return
 
-    signals = daily_signals.copy()
-    signals["date"] = pd.to_datetime(signals["date"])
-    latest_date = signals["date"].max()
-    today = signals[signals["date"] == latest_date].copy()
-
-    st.caption(f"가장 최근 신호일: {latest_date.strftime('%Y-%m-%d')}")
-    col1, col2, col3, col4 = st.columns(4)
-    actionable = today[today["action"].isin(["BUY", "ADD", "TRIM", "SELL"])]
-    col1.metric("오늘 액션 수", f"{len(actionable)}건")
-    col2.metric("신규 매수", f"{int((today['action'] == 'BUY').sum())}건")
-    col3.metric("감축/매도", f"{int(today['action'].isin(['TRIM', 'SELL']).sum())}건")
-    col4.metric("유지", f"{int((today['action'] == 'HOLD').sum())}건")
-
-    st.markdown("**오늘의 포트폴리오 변경 제안**")
-    display_today = today[
-        [
-            "action",
-            "ticker",
-            "current_shares",
-            "current_weight",
-            "target_weight",
-            "weight_gap",
-            "latest_price",
-            "reason",
-        ]
-    ].copy()
-    for column in ["current_weight", "target_weight", "weight_gap"]:
-        display_today[column] = display_today[column].map(pct)
-    display_today["latest_price"] = display_today["latest_price"].map(num)
-    display_today = display_today.rename(
-        columns={
-            "action": "액션",
-            "ticker": "종목",
-            "current_shares": "현재주수",
-            "current_weight": "현재비중",
-            "target_weight": "목표비중",
-            "weight_gap": "비중차이",
-            "latest_price": "최신가격",
-            "reason": "사유",
-        }
-    )
-    st.dataframe(display_today, use_container_width=True, hide_index=True)
-
-    st.markdown("**일별 신호 히스토리**")
-    history = signals.copy().sort_values(["date", "action", "ticker"], ascending=[False, True, True])
-    action_filter = st.multiselect(
-        "액션 필터",
-        options=sorted(history["action"].dropna().unique().tolist()),
-        default=["BUY", "ADD", "TRIM", "SELL", "HOLD"],
-    )
-    if action_filter:
-        history = history[history["action"].isin(action_filter)]
-    history_display = history[
-        ["date", "action", "ticker", "current_weight", "target_weight", "weight_gap", "score", "reason"]
-    ].copy()
-    history_display["date"] = history_display["date"].dt.strftime("%Y-%m-%d")
-    for column in ["current_weight", "target_weight", "weight_gap"]:
-        history_display[column] = history_display[column].map(pct)
-    history_display["score"] = history_display["score"].map(lambda x: "-" if pd.isna(x) else f"{x:,.4f}")
-    history_display = history_display.rename(
-        columns={
-            "date": "날짜",
-            "action": "액션",
-            "ticker": "종목",
-            "current_weight": "현재비중",
-            "target_weight": "목표비중",
-            "weight_gap": "비중차이",
-            "score": "점수",
-            "reason": "사유",
-        }
-    )
-    st.dataframe(history_display, use_container_width=True, hide_index=True)
-
-
-def render_action_backtest_summary(
-    selected_row: pd.Series,
-    daily_action_summary: pd.DataFrame,
-    daily_action_equity: pd.DataFrame,
-) -> None:
-    if daily_action_summary.empty:
-        st.info("일별 액션 추종 성과 요약이 없습니다.")
-        return
-    summary_row = daily_action_summary.iloc[0]
-    st.markdown("**일별 신호 히스토리를 실제로 매일 따라갔을 때의 백테스트 성과**")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("초기 자본", num(float(summary_row["initial_capital"])))
-    col2.metric("최종 자산", num(float(summary_row["final_equity"])))
-    col3.metric("총수익률", pct(float(summary_row["total_return"])))
-    col4.metric("CAGR", pct(float(summary_row["cagr"])))
-    st.caption(
-        f"선택 조합: {selected_row['strategy']} | {frequency_label(str(selected_row['rebalance_frequency']))} | Top N {int(selected_row['top_n'])}"
-    )
-    st.caption(
-        f"즉, 아래 일별 신호 히스토리를 매 거래일 그대로 적용했다고 가정하면 자본이 {num(float(summary_row['initial_capital']))} → {num(float(summary_row['final_equity']))}로 변했습니다. 리밸런싱 주기 백테스트와는 별도의 추종 결과입니다."
-    )
-    if "rebalance_count" in summary_row:
-        st.caption(f"실제 일별 추종에서 발생한 거래일 수: {int(summary_row['rebalance_count'])}회")
-
-    if daily_action_equity.empty:
-        return
-    chart_df = daily_action_equity.copy()
-    fig = px.line(chart_df, x="date", y="equity", template="plotly_white")
-    fig.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10))
-    st.plotly_chart(fig, use_container_width=True)
 
 
 def render_downloads() -> None:
@@ -753,7 +706,6 @@ def render_downloads() -> None:
         ("monthly_portfolio_history.csv", "월별 포트폴리오 CSV"),
         ("trade_log.csv", "매매 로그 CSV"),
         ("rebalance_summary.csv", "리밸런싱 요약 CSV"),
-        ("daily_signals.csv", "일별 액션 CSV"),
     ]
     cols = st.columns(3)
     for index, (filename, label) in enumerate(download_specs):
@@ -824,6 +776,35 @@ def main() -> None:
             help="각 리밸런싱 체결 직전에 현금으로 추가 투입되는 금액입니다.",
         )
         transaction_cost_bps = st.number_input("거래 비용 bps", min_value=0.0, value=7.0, step=1.0)
+        allocation_override = st.selectbox(
+            "자산 배분 방식 (일괄 변경)",
+            options=[None, "equal_weight", "inverse_volatility", "risk_parity", "mean_variance"],
+            format_func=lambda x: {
+                None: "전략 기본값 적용",
+                "equal_weight": "동일 비중 (Equal)",
+                "inverse_volatility": "역변동성 비중 (Inverse Vol)",
+                "risk_parity": "리스크 패리티 (Risk Parity)",
+                "mean_variance": "평균-분산 최적화 (MVO)"
+            }.get(x, str(x)),
+            help="백테스트할 모든 전략의 자산 배분 방식을 일괄적으로 오버라이드합니다."
+        )
+
+        with st.expander("커스텀 하이브리드 빌더"):
+            st.caption("여러 팩터의 비중을 믹스하여 '하이브리드 전략'을 백테스트에 포함합니다.")
+            hybrid_weights = {}
+            factors = {
+                "momentum_3m": "3개월 모멘텀",
+                "momentum_6m": "6개월 모멘텀",
+                "momentum_12m": "12개월 모멘텀",
+                "risk_adjusted_momentum": "위험조정 모멘텀",
+                "breakout_52w": "52주 신고가 근접도",
+                "low_vol_momentum": "저변동성 모멘텀"
+            }
+            for name, label in factors.items():
+                w = st.slider(f"{label} 비중", min_value=0.0, max_value=1.0, value=0.0, step=0.1, key=f"hybrid_w_{name}")
+                if w > 0:
+                    hybrid_weights[name] = w
+
         rebalance_shift_days = st.slider(
             "리밸런싱 일수 앞당김 (시프트 데이)",
             min_value=0,
@@ -844,8 +825,9 @@ def main() -> None:
         try:
             top_n_values = parse_top_n_text(top_n_text)
             rebalance_frequencies = parse_frequency_text(frequency_text)
-            if not strategy_names:
-                raise ValueError("전략을 하나 이상 선택해야 합니다.")
+            if hybrid_weights:
+                if "hybrid_strategy" not in strategy_names:
+                    strategy_names.append("hybrid_strategy")
             with st.spinner("백테스트를 실행 중입니다. 조합이 많으면 몇 분 정도 걸릴 수 있습니다."):
                 st.session_state["results"] = run_backtest(
                     start=start_value.isoformat(),
@@ -858,6 +840,8 @@ def main() -> None:
                     transaction_cost_bps=transaction_cost_bps,
                     force_refresh=force_refresh,
                     rebalance_shift_days=rebalance_shift_days,
+                    allocation_override=allocation_override,
+                    hybrid_weights=hybrid_weights,
                 )
             st.success("백테스트가 완료되었습니다.")
         except Exception as exc:
@@ -933,8 +917,8 @@ def main() -> None:
     if results.get("strategy_names"):
         st.caption("비교한 전략: " + ", ".join(results["strategy_names"]))
 
-    tab_overview, tab_recommend, tab_actions, tab_rebalance, tab_results = st.tabs(
-        ["개요", "추천 및 매수 계획", "오늘의 액션", "리밸런싱 로그", "전체 결과"]
+    tab_overview, tab_recommend, tab_rebalance, tab_results = st.tabs(
+        ["개요", "추천 및 매수 계획", "리밸런싱 로그", "전체 결과"]
     )
 
     with tab_overview:
@@ -980,6 +964,7 @@ def main() -> None:
                 budget=budget,
                 title="마지막 실제 체결 포트폴리오 기준",
                 caption=f"마지막 실행일은 {last_trade_date} 입니다. 실제로 마지막 리밸런싱이 체결된 포트폴리오를 기준으로 계산합니다.",
+                key_suffix="actual",
             )
             signal_holdings = build_signal_target_holdings(
                 view_results["latest_recommendations"],
@@ -993,16 +978,8 @@ def main() -> None:
                     f"신호 기준일은 {signal_as_of} 종가입니다. "
                     "다음 거래일 시가에 실행된다고 가정하기 전의 계획용 계산이며, 현재는 최신 종가를 기준 가격으로 사용합니다."
                 ),
+                key_suffix="recommended",
             )
-
-    with tab_actions:
-        st.subheader("오늘의 액션 가이드")
-        render_action_backtest_summary(
-            selected_row,
-            view_results.get("daily_action_summary", pd.DataFrame()),
-            view_results.get("daily_action_equity", pd.DataFrame()),
-        )
-        render_daily_actions(view_results["daily_signals"])
 
     with tab_rebalance:
         st.subheader("리밸런싱 실행 내역")

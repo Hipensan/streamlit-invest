@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+import scipy.optimize as sco
+
 from rebalance_lab.strategies import Strategy, build_strategy_library
 
 
@@ -49,18 +51,6 @@ class StrategyRun:
     trade_log: pd.DataFrame
     portfolio_history: pd.DataFrame
     rebalance_summary: pd.DataFrame
-    daily_signals: pd.DataFrame
-
-
-@dataclass
-class DailySignalBacktest:
-    initial_capital: float
-    final_equity: float
-    total_return: float
-    cagr: float
-    equity_curve: pd.Series
-    daily_signals: pd.DataFrame
-    rebalance_count: int
 
 
 class MonthlyBacktester:
@@ -78,6 +68,8 @@ class MonthlyBacktester:
         rebalance_contribution: float = 0.0,
         rebalance_shift_days: int = 30,
         non_trading_day_adjustment: str = "prior",
+        allocation_mode_override: str | None = None,
+        hybrid_weights: dict[str, float] | None = None,
     ) -> None:
         self.open_prices = open_prices.sort_index().copy()
         self.close_prices = close_prices.sort_index().copy()
@@ -98,6 +90,8 @@ class MonthlyBacktester:
         self.rebalance_frequency = rebalance_frequency
         self.rebalance_shift_days = rebalance_shift_days
         self.non_trading_day_adjustment = non_trading_day_adjustment
+        self.allocation_mode_override = allocation_mode_override
+        self.hybrid_weights = hybrid_weights or {}
         self.eligible_from = {ticker: None for ticker in self.universe}
         if eligible_from:
             for ticker, value in eligible_from.items():
@@ -118,7 +112,18 @@ class MonthlyBacktester:
         self.high_126 = self.close_prices.rolling(126).max()
         self.drawdown_126 = self.close_prices / self.high_126 - 1.0
         self.high_252 = self.close_prices.rolling(252).max()
+        # RSI 14일 연산 매트릭스 사전 계산 (Wilder's 방식)
+        delta = self.close_prices.diff()
+        gain = delta.clip(lower=0.0)
+        loss = -delta.clip(upper=0.0)
+        avg_gain = gain.ewm(alpha=1.0/14.0, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1.0/14.0, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0.0, np.nan)
+        self.rsi_14 = 100.0 - (100.0 / (1.0 + rs))
+        self.rsi_14 = self.rsi_14.fillna(50.0)
+
         self.rebalance_schedule: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+        self.average_costs: dict[str, float] = {}
         self._refresh_rebalance_schedule()
 
     def _refresh_rebalance_schedule(self) -> None:
@@ -162,6 +167,24 @@ class MonthlyBacktester:
         else:
             raise ValueError(f"Unsupported rebalance frequency: {self.rebalance_frequency}")
 
+        # 미완성 기간(주, 월, 분기, 연)의 임시 말일 제거 로직
+        if not original_dates.empty:
+            last_orig = original_dates[-1]
+            max_data_date = self.close_prices.index[-1]
+            if frequency == "weekly":
+                period_end = last_orig + pd.offsets.Week(0, weekday=4)
+            elif frequency in ["monthly", "bimonthly"]:
+                period_end = last_orig + pd.offsets.MonthEnd(0)
+            elif frequency in ["quarterly", "semiannual"]:
+                period_end = last_orig + pd.offsets.QuarterEnd(0)
+            elif frequency == "annual":
+                period_end = last_orig + pd.offsets.YearEnd(0)
+            else:
+                period_end = last_orig
+
+            if period_end > max_data_date:
+                original_dates = original_dates[:-1]
+
         if self.rebalance_shift_days == 0:
             return original_dates
 
@@ -204,6 +227,21 @@ class MonthlyBacktester:
 
     def score_strategy(self, strategy_name: str, date: pd.Timestamp) -> pd.Series:
         universe = self.universe
+        if strategy_name == "hybrid_strategy":
+            combined_rank = pd.Series(0.0, index=universe)
+            total_weight = 0.0
+            for sub_name, weight in self.hybrid_weights.items():
+                if weight <= 0:
+                    continue
+                sub_score = self.score_strategy(sub_name, date)
+                if sub_score.empty:
+                    continue
+                sub_rank = sub_score.rank(pct=True)
+                combined_rank = combined_rank.add(sub_rank * weight, fill_value=0.0)
+                total_weight += weight
+            if total_weight > 0:
+                return combined_rank / total_weight
+            return pd.Series(0.0, index=universe)
         ret_21 = self.ret_21.loc[date, universe]
         ret_63 = self.ret_63.loc[date, universe]
         ret_126 = self.ret_126.loc[date, universe]
@@ -231,35 +269,27 @@ class MonthlyBacktester:
             return (ret_252 - ret_21).where(eligibility_mask)
         if strategy_name == "risk_adjusted_momentum":
             return (ret_252 / vol_63).where(eligibility_mask)
-        if strategy_name == "trend_filtered_momentum":
-            if not self._benchmark_uptrend(date):
-                return pd.Series(dtype=float)
-            return ret_252.where(above_sma & eligibility_mask)
         if strategy_name == "low_vol_momentum":
             score = ret_126 - (0.75 * vol_63)
             return score.where(eligibility_mask)
         if strategy_name == "breakout_52w":
             score = (0.60 * ret_126) + (0.40 * breakout.rank(pct=True))
             return score.where(above_sma & eligibility_mask)
-        if strategy_name == "blend_momentum":
-            score = (0.45 * ret_252) + (0.35 * ret_126) - (0.20 * vol_63) - (0.10 * ret_21.rank(pct=True))
-            score = score.where(above_sma & eligibility_mask)
-            if not self._benchmark_uptrend(date):
-                return pd.Series(dtype=float)
-            return score
-        if strategy_name == "volume_confirmed_momentum":
-            liquidity_tailwind = rel_volume_21.rank(pct=True)
-            score = ret_126 + (0.10 * liquidity_tailwind) + (0.05 * dollar_volume_21.rank(pct=True))
-            return score.where((rel_volume_21 > 1.0) & above_sma & eligibility_mask)
-        if strategy_name == "volume_adjusted_momentum":
-            score = (ret_126 * rel_volume_21.rank(pct=True)) - (0.35 * vol_63)
-            return score.where((rel_volume_21 > 0.9) & above_sma & eligibility_mask)
         if strategy_name == "drawdown_filtered_momentum":
             score = (0.55 * ret_252) + (0.45 * ret_126) - (0.20 * vol_63)
             score = score.where((drawdown_126 > -0.15) & above_sma & eligibility_mask)
             if not self._benchmark_uptrend(date):
                 return pd.Series(dtype=float)
             return score
+        if strategy_name == "low_volatility":
+            return (-vol_63).where(eligibility_mask)
+        if strategy_name == "mean_reversion_rsi":
+            rsi_val = self.rsi_14.loc[date, universe]
+            return (-rsi_val).where(eligibility_mask)
+        if strategy_name == "high_liquidity":
+            return dollar_volume_21.where(eligibility_mask)
+        if strategy_name == "min_drawdown":
+            return drawdown_126.where(eligibility_mask)
         raise ValueError(f"Unknown strategy: {strategy_name}")
 
     def select_target_tickers(
@@ -270,7 +300,7 @@ class MonthlyBacktester:
     ) -> tuple[list[str], pd.Series]:
         score = self.score_strategy(strategy.name, date)
         score = score.replace([np.inf, -np.inf], np.nan).dropna().sort_values(ascending=False)
-        if strategy.name in {"trend_filtered_momentum", "volume_confirmed_momentum", "volume_adjusted_momentum", "drawdown_filtered_momentum"}:
+        if strategy.name in {"drawdown_filtered_momentum"}:
             score = score[score > 0]
         return score.head(top_n).index.tolist(), score
 
@@ -300,15 +330,85 @@ class MonthlyBacktester:
         weights = pd.Series(dtype=float)
         if not selected:
             return weights
-        if strategy.allocation_mode == "inverse_volatility":
+
+        mode = self.allocation_mode_override or strategy.allocation_mode
+        if mode == "inverse_volatility":
             volatility = self.vol_63.loc[signal_date, selected].replace(0.0, np.nan)
             inverse_vol = 1.0 / volatility
             inverse_vol = inverse_vol.replace([np.inf, -np.inf], np.nan).dropna()
             if not inverse_vol.empty and float(inverse_vol.sum()) > 0:
                 weights = inverse_vol / inverse_vol.sum()
+        elif mode == "risk_parity":
+            weights = self._calculate_risk_parity_weights(selected, signal_date)
+        elif mode == "mean_variance":
+            weights = self._calculate_mvo_weights(selected, signal_date)
+
         if weights.empty:
             weights = pd.Series(1.0 / len(selected), index=selected, dtype=float)
         return weights.sort_values(ascending=False)
+
+    def _calculate_risk_parity_weights(self, selected: list[str], signal_date: pd.Timestamp) -> pd.Series:
+        n = len(selected)
+        if n == 0:
+            return pd.Series(dtype=float)
+
+        recent_returns = self.daily_returns.loc[:signal_date, selected].tail(63)
+        if len(recent_returns) < 5 or recent_returns.isnull().all().all():
+            return pd.Series(1.0 / n, index=selected, dtype=float)
+
+        cov = recent_returns.cov().fillna(0.0).values * 252
+        if np.all(np.diag(cov) == 0):
+            return pd.Series(1.0 / n, index=selected, dtype=float)
+
+        def objective(w):
+            port_vol = np.sqrt(np.dot(w.T, np.dot(cov, w)))
+            if port_vol == 0:
+                return 0
+            rc = w * np.dot(cov, w) / port_vol
+            diff = rc[:, np.newaxis] - rc[np.newaxis, :]
+            return np.sum(diff ** 2)
+
+        cons = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0})
+        bounds = [(0.0, 1.0) for _ in range(n)]
+        init_w = np.ones(n) / n
+
+        res = sco.minimize(objective, init_w, method='SLSQP', bounds=bounds, constraints=cons)
+        if res.success:
+            return pd.Series(res.x, index=selected, dtype=float)
+        return pd.Series(init_w, index=selected, dtype=float)
+
+    def _calculate_mvo_weights(self, selected: list[str], signal_date: pd.Timestamp) -> pd.Series:
+        n = len(selected)
+        if n == 0:
+            return pd.Series(dtype=float)
+
+        recent_returns = self.daily_returns.loc[:signal_date, selected].tail(126)
+        if len(recent_returns) < 5 or recent_returns.isnull().all().all():
+            return pd.Series(1.0 / n, index=selected, dtype=float)
+
+        expected_returns = recent_returns.mean().fillna(0.0).values * 252
+        cov = recent_returns.cov().fillna(0.0).values * 252
+
+        if np.all(np.diag(cov) == 0):
+            return pd.Series(1.0 / n, index=selected, dtype=float)
+
+        rf = 0.02
+        def objective(w):
+            port_return = np.dot(w, expected_returns)
+            port_vol = np.sqrt(np.dot(w.T, np.dot(cov, w)))
+            if port_vol == 0:
+                return 0
+            return - (port_return - rf) / port_vol
+
+        cons = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0})
+        max_bound = max(1.0 / n, 0.4)
+        bounds = [(0.0, max_bound) for _ in range(n)]
+        init_w = np.ones(n) / n
+
+        res = sco.minimize(objective, init_w, method='SLSQP', bounds=bounds, constraints=cons)
+        if res.success:
+            return pd.Series(res.x, index=selected, dtype=float)
+        return pd.Series(init_w, index=selected, dtype=float)
 
     def _build_target_shares(
         self,
@@ -456,6 +556,33 @@ class MonthlyBacktester:
             price = float(execution_price_row.at[ticker])
             notional = shares * price
             fee = notional * self.transaction_cost
+
+            # 평단가 및 PnL 계산
+            purchase_price = np.nan
+            realized_pnl = np.nan
+            realized_pnl_pct = np.nan
+
+            pre_shares = int(current_shares.at[ticker])
+            post_shares = int(target_shares.at[ticker])
+
+            if delta < 0:  # 매도 (SELL / TRIM)
+                prev_cost = float(self.average_costs.get(ticker, 0.0))
+                if prev_cost > 0:
+                    purchase_price = prev_cost
+                    purchase_notional = shares * prev_cost
+                    realized_pnl = notional - purchase_notional
+                    realized_pnl_pct = realized_pnl / purchase_notional if purchase_notional > 0 else 0.0
+
+                if post_shares == 0:
+                    self.average_costs[ticker] = 0.0
+            else:  # 매수 (BUY / ADD)
+                prev_cost = float(self.average_costs.get(ticker, 0.0))
+                if pre_shares + shares > 0:
+                    new_cost = (pre_shares * prev_cost + shares * price) / (pre_shares + shares)
+                    self.average_costs[ticker] = new_cost
+                else:
+                    self.average_costs[ticker] = price
+
             trade_rows.append(
                 {
                     "strategy": strategy.name,
@@ -471,8 +598,11 @@ class MonthlyBacktester:
                     "notional": notional,
                     "fee": fee,
                     "allocation_mode": strategy.allocation_mode,
-                    "pre_shares": int(current_shares.at[ticker]),
-                    "post_shares": int(target_shares.at[ticker]),
+                    "pre_shares": pre_shares,
+                    "post_shares": post_shares,
+                    "purchase_price": purchase_price,
+                    "realized_pnl": realized_pnl,
+                    "realized_pnl_pct": realized_pnl_pct,
                     "rank_on_signal": ranked_lookup.get(ticker),
                 }
             )
@@ -617,6 +747,7 @@ class MonthlyBacktester:
         )
 
     def run(self, strategy: Strategy, top_n: int) -> StrategyRun:
+        self.average_costs = {ticker: 0.0 for ticker in self.universe}
         (
             shares_history,
             cash_series,
@@ -653,46 +784,9 @@ class MonthlyBacktester:
             trade_log=trade_log,
             portfolio_history=portfolio_history,
             rebalance_summary=rebalance_summary,
-            daily_signals=self.build_daily_signals(
-                strategy=strategy,
-                top_n=top_n,
-                shares_history=shares_history,
-                cash_series=cash_series,
-            ),
         )
 
-    def simulate_daily_signal_follow(self, strategy: Strategy, top_n: int) -> DailySignalBacktest:
-        index = self.close_prices.index
-        daily_schedule = [(index[position], index[position + 1]) for position in range(len(index) - 1)]
-        shares_history, cash_series, contribution_series, _, _, _, rebalance_summary = self._execute_schedule(
-            strategy=strategy,
-            top_n=top_n,
-            schedule=daily_schedule,
-            apply_contributions=False,
-        )
-        holdings_value_close = shares_history.astype(float) * self.close_prices[self.universe]
-        total_equity = holdings_value_close.sum(axis=1) + cash_series
-        daily_returns = self._cash_flow_adjusted_returns(total_equity, contribution_series)
-        equity_curve = (1.0 + daily_returns).cumprod()
-        observed = equity_curve[equity_curve > 0]
-        final_equity = float(total_equity.iloc[-1]) if not total_equity.empty else self.initial_capital
-        total_return = float(observed.iloc[-1] - 1.0) if not observed.empty else 0.0
-        cagr = float(observed.iloc[-1] ** (252 / max(len(observed), 1)) - 1.0) if not observed.empty else 0.0
-        daily_signals = self.build_daily_signals(
-            strategy=strategy,
-            top_n=top_n,
-            shares_history=shares_history,
-            cash_series=cash_series,
-        )
-        return DailySignalBacktest(
-            initial_capital=self.initial_capital,
-            final_equity=final_equity,
-            total_return=total_return,
-            cagr=cagr,
-            equity_curve=equity_curve,
-            daily_signals=daily_signals,
-            rebalance_count=int((rebalance_summary["traded_notional"] > 0).sum()) if not rebalance_summary.empty else 0,
-        )
+
 
     def _cash_flow_adjusted_returns(self, total_equity: pd.Series, contribution_series: pd.Series) -> pd.Series:
         previous_equity = total_equity.shift(1)
@@ -816,71 +910,7 @@ class MonthlyBacktester:
             non_trading_day_adjustment=self.non_trading_day_adjustment,
         )
 
-    def build_daily_signals(
-        self,
-        strategy: Strategy,
-        top_n: int,
-        shares_history: pd.DataFrame,
-        cash_series: pd.Series,
-    ) -> pd.DataFrame:
-        rows: list[dict[str, object]] = []
-        for date in self.close_prices.index:
-            selected, ranking = self.select_target_tickers(strategy=strategy, date=date, top_n=top_n)
-            if not selected and ranking.empty:
-                continue
-            current_shares = shares_history.loc[date].reindex(self.universe).fillna(0).astype(int)
-            current_prices = self.close_prices.loc[date, self.universe].fillna(0.0)
-            holdings_value = (current_shares * current_prices).astype(float)
-            cash_value = float(cash_series.loc[date])
-            total_equity = float(holdings_value.sum() + cash_value)
-            current_weights = holdings_value / total_equity if total_equity > 0 else holdings_value * 0.0
-            target_weights = self._build_target_weights(strategy=strategy, selected=selected, signal_date=date)
-            signal_tickers = list(dict.fromkeys(selected + current_shares[current_shares > 0].index.tolist()))
-            for ticker in signal_tickers:
-                target_weight = float(target_weights.get(ticker, 0.0))
-                current_weight = float(current_weights.get(ticker, 0.0))
-                selected_today = ticker in selected
-                currently_held = int(current_shares.get(ticker, 0)) > 0
-                weight_gap = target_weight - current_weight
-                score = float(ranking.get(ticker, np.nan)) if ticker in ranking.index else np.nan
-                if selected_today and not currently_held:
-                    action = "BUY"
-                    reason = "New target holding from latest signal"
-                elif selected_today and currently_held and abs(weight_gap) <= 0.02:
-                    action = "HOLD"
-                    reason = "Current holding remains close to target weight"
-                elif selected_today and currently_held and weight_gap > 0:
-                    action = "ADD"
-                    reason = "Current weight is below target weight"
-                elif selected_today and currently_held:
-                    action = "TRIM"
-                    reason = "Current weight is above target weight"
-                elif currently_held:
-                    action = "SELL"
-                    reason = "Ticker is no longer selected by the signal"
-                else:
-                    action = "WATCH"
-                    reason = "Candidate ranks highly but is not in the target set"
-                rows.append(
-                    {
-                        "date": date.strftime("%Y-%m-%d"),
-                        "ticker": ticker,
-                        "action": action,
-                        "reason": reason,
-                        "score": score,
-                        "selected": selected_today,
-                        "currently_held": currently_held,
-                        "current_shares": int(current_shares.get(ticker, 0)),
-                        "current_weight": current_weight,
-                        "target_weight": target_weight,
-                        "weight_gap": weight_gap,
-                        "latest_price": float(current_prices.get(ticker, np.nan)),
-                        "allocation_mode": strategy.allocation_mode,
-                        "rebalance_frequency": self.rebalance_frequency,
-                        "top_n": top_n,
-                    }
-                )
-        return pd.DataFrame(rows)
+
 
 
 def evaluate_strategies(
@@ -891,6 +921,10 @@ def evaluate_strategies(
 ) -> list[StrategyRun]:
     runs: list[StrategyRun] = []
     strategies = build_strategy_library()
+    if backtester.hybrid_weights:
+        hybrid_desc = "Blended: " + ", ".join(f"{k}({v:.1f})" for k, v in backtester.hybrid_weights.items())
+        strategies.append(Strategy(name="hybrid_strategy", description=hybrid_desc))
+
     if strategy_names is not None:
         selected_names = list(dict.fromkeys(strategy_names))
         strategy_lookup = {strategy.name: strategy for strategy in strategies}
@@ -971,25 +1005,7 @@ def save_result_artifacts(
     ranking_frame.insert(0, "as_of", ranking_date.strftime("%Y-%m-%d"))
     ranking_frame.to_csv(output_dir / "latest_recommendations.csv", index=False)
 
-    daily_follow = backtester.simulate_daily_signal_follow(best_run.strategy, best_run.top_n)
-    daily_follow.daily_signals.to_csv(output_dir / "daily_signals.csv", index=False)
-    pd.DataFrame(
-        {
-            "date": daily_follow.equity_curve.index.strftime("%Y-%m-%d"),
-            "equity": daily_follow.equity_curve.values,
-        }
-    ).to_csv(output_dir / "daily_signal_equity.csv", index=False)
-    pd.DataFrame(
-        [
-            {
-                "initial_capital": daily_follow.initial_capital,
-                "final_equity": daily_follow.final_equity,
-                "total_return": daily_follow.total_return,
-                "cagr": daily_follow.cagr,
-                "rebalance_count": daily_follow.rebalance_count,
-            }
-        ]
-    ).to_csv(output_dir / "daily_signal_summary.csv", index=False)
+
 
     best_run.trade_log.to_csv(output_dir / "trade_log.csv", index=False)
     best_run.portfolio_history.to_csv(output_dir / "monthly_portfolio_history.csv", index=False)
