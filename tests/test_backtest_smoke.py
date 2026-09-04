@@ -372,6 +372,48 @@ def test_rebalance_shift_and_adjustment() -> None:
     assert pd.Timestamp("2023-01-24") not in signal_dates
 
 
+def test_shifted_rebalance_in_incomplete_month_is_included_after_execution_date() -> None:
+    index = pd.bdate_range("2026-07-01", "2026-09-04")
+    close_prices = pd.DataFrame(
+        {
+            "AAA": np.linspace(100, 120, len(index)),
+            "SPY": np.linspace(100, 110, len(index)),
+        },
+        index=index,
+    )
+
+    backtester = MonthlyBacktester(
+        open_prices=close_prices * 0.99,
+        close_prices=close_prices,
+        volume_prices=None,
+        universe=["AAA"],
+        rebalance_frequency="monthly",
+        rebalance_shift_days=30,
+        non_trading_day_adjustment="prior",
+    )
+
+    assert (pd.Timestamp("2026-08-31"), pd.Timestamp("2026-09-01")) in backtester.rebalance_schedule
+
+
+def test_shifted_rebalance_in_incomplete_month_is_not_included_before_signal_date() -> None:
+    index = pd.bdate_range("2026-07-01", "2026-09-04")
+    close_prices = pd.DataFrame(
+        {"AAA": 100.0, "SPY": 100.0},
+        index=index,
+    )
+
+    backtester = MonthlyBacktester(
+        open_prices=close_prices,
+        close_prices=close_prices,
+        volume_prices=None,
+        universe=["AAA"],
+        rebalance_frequency="monthly",
+        rebalance_shift_days=7,
+    )
+
+    assert all(signal_date < pd.Timestamp("2026-09-01") for signal_date, _ in backtester.rebalance_schedule)
+
+
 
 def test_price_cache_refreshes_when_requested_range_is_not_covered(monkeypatch) -> None:
     cached_index = pd.bdate_range("2020-01-02", periods=5)

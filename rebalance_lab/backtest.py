@@ -170,7 +170,9 @@ class MonthlyBacktester:
         else:
             raise ValueError(f"Unsupported rebalance frequency: {self.rebalance_frequency}")
 
-        # 미완성 기간(주, 월, 분기, 연)의 임시 말일 제거 로직
+        # 미완성 기간은 기본적으로 제외한다. 다만 시프트된 기준일과
+        # 그 다음 거래일이 이미 데이터에 있는 경우에는 현재 기간도 포함한다.
+        incomplete_period_end: pd.Timestamp | None = None
         if not original_dates.empty:
             last_orig = original_dates[-1]
             max_data_date = self.close_prices.index[-1]
@@ -186,7 +188,14 @@ class MonthlyBacktester:
                 period_end = last_orig
 
             if period_end > max_data_date:
-                original_dates = original_dates[:-1]
+                if self.rebalance_shift_days > 0:
+                    shifted_target = period_end - pd.Timedelta(days=self.rebalance_shift_days)
+                    if shifted_target < max_data_date:
+                        incomplete_period_end = period_end
+                    else:
+                        original_dates = original_dates[:-1]
+                else:
+                    original_dates = original_dates[:-1]
 
         if self.rebalance_shift_days == 0:
             return original_dates
@@ -194,6 +203,8 @@ class MonthlyBacktester:
         adjusted_dates = []
         trading_days = self.close_prices.index
         for d in original_dates:
+            if incomplete_period_end is not None and d == original_dates[-1]:
+                d = incomplete_period_end
             target = d - pd.Timedelta(days=self.rebalance_shift_days)
             if target in trading_days:
                 adjusted_dates.append(target)
