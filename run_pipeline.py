@@ -229,7 +229,7 @@ def main() -> None:
     print(f"Best strategy: {best_row['strategy']} ({best_row['description']})")
     print(f"Best Frequency: {best_row['rebalance_frequency']}")
     print(f"Best Top N: {int(best_row['top_n'])}")
-    print("Execution assumption: signal on period-end close, trade on next trading day open")
+    print("Execution assumption: signal on scheduled close, trade on next trading day open")
     print(f"Initial capital: {best_row['initial_capital']:.2f}")
     print(f"Total contributions: {best_row.get('total_contributions', 0.0):.2f}")
     print(f"Total invested capital: {best_row.get('total_invested_capital', best_row['initial_capital']):.2f}")
@@ -296,7 +296,7 @@ def write_report(
         f"- Universe size used: {universe_size} stocks",
         f"- Rebalance frequencies tested: {', '.join(rebalance_frequencies)}",
         f"- Strategies tested: {', '.join(tested_strategy_names)}",
-        "- Execution assumption: signal on period-end close, trade on next trading day open",
+        "- Execution assumption: signal on scheduled close, trade on next trading day open",
         f"- Best strategy: {best_row['strategy']}",
         f"- Description: {best_row['description']}",
         f"- Best rebalance frequency: {best_row['rebalance_frequency']}",

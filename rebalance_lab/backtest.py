@@ -9,10 +9,31 @@ import pandas as pd
 
 import scipy.optimize as sco
 
+from rebalance_lab.schedule import calculate_next_rebalance_date, rebalance_dates
 from rebalance_lab.strategies import Strategy, build_strategy_library
 
 
 CONTROL_TICKERS = ["SPY"]
+
+
+def _wilder_rsi(prices: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    changes = prices.diff().to_numpy(dtype=float)
+    result = np.full(changes.shape, np.nan)
+    count = np.zeros(changes.shape[1], dtype=int)
+    gains = np.zeros(changes.shape[1])
+    movement = np.zeros(changes.shape[1])
+    for i, change in enumerate(changes):
+        valid = np.isfinite(change)
+        # Seed with the first full window, then use Wilder's smoothing.
+        decay = np.where(count >= period, (period - 1) / period, 1.0)
+        gains = np.where(valid, gains * decay + np.maximum(change, 0), 0)
+        movement = np.where(valid, movement * decay + np.abs(change), 0)
+        count = np.where(valid, count + 1, 0)
+        ready = count >= period
+        moving = ready & (movement > 0)
+        result[i, moving] = 100 * gains[moving] / movement[moving]
+        result[i, ready & ~moving] = 50
+    return pd.DataFrame(result, index=prices.index, columns=prices.columns)
 
 
 @dataclass
@@ -34,6 +55,9 @@ class BacktestMetrics:
     max_drawdown: float
     avg_monthly_turnover: float
     rebalance_count: int
+    rebalance_shift_days: int
+    next_signal_date: str
+    next_effective_date: str
 
 
 @dataclass
@@ -98,8 +122,12 @@ class MonthlyBacktester:
                 if ticker in self.eligible_from:
                     self.eligible_from[ticker] = value
 
-        self.trade_prices = self.open_prices[self.universe].astype(float)
-        self.daily_returns = self.close_prices.pct_change(fill_method=None).fillna(0.0)
+        self.close_prices = self.close_prices.where(np.isfinite(self.close_prices) & (self.close_prices > 0))
+        opens = self.open_prices.reindex(index=self.close_prices.index, columns=self.universe).astype(float)
+        self.trade_prices = opens.where(np.isfinite(opens) & (opens > 0))
+        # A stale price can value a holding, but only an actual open can fill an order.
+        self.valuation_prices = self.close_prices[self.universe].fillna(self.trade_prices).ffill()
+        self.daily_returns = self.close_prices.pct_change(fill_method=None)
         self.ret_21 = self.close_prices / self.close_prices.shift(21) - 1.0
         self.ret_63 = self.close_prices / self.close_prices.shift(63) - 1.0
         self.ret_126 = self.close_prices / self.close_prices.shift(126) - 1.0
@@ -112,15 +140,7 @@ class MonthlyBacktester:
         self.high_126 = self.close_prices.rolling(126).max()
         self.drawdown_126 = self.close_prices / self.high_126 - 1.0
         self.high_252 = self.close_prices.rolling(252).max()
-        # RSI 14일 연산 매트릭스 사전 계산 (Wilder's 방식)
-        delta = self.close_prices.diff()
-        gain = delta.clip(lower=0.0)
-        loss = -delta.clip(upper=0.0)
-        avg_gain = gain.ewm(alpha=1.0/14.0, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1.0/14.0, adjust=False).mean()
-        rs = avg_gain / avg_loss.replace(0.0, np.nan)
-        self.rsi_14 = 100.0 - (100.0 / (1.0 + rs))
-        self.rsi_14 = self.rsi_14.fillna(50.0)
+        self.rsi_14 = _wilder_rsi(self.close_prices)
 
         self.rebalance_schedule: list[tuple[pd.Timestamp, pd.Timestamp]] = []
         self.average_costs: dict[str, float] = {}
@@ -130,133 +150,42 @@ class MonthlyBacktester:
         self._refresh_rebalance_schedule()
 
     def _refresh_rebalance_schedule(self) -> None:
-        signal_dates = self._build_signal_dates()
-        self.rebalance_schedule: list[tuple[pd.Timestamp, pd.Timestamp]] = []
-        for signal_date in signal_dates:
-            signal_position = self.close_prices.index.get_loc(signal_date)
-            if signal_position + 1 >= len(self.close_prices.index):
-                break
-            effective_date = self.close_prices.index[signal_position + 1]
-            self.rebalance_schedule.append((signal_date, effective_date))
+        observed = self.close_prices.index
+        last = observed[-1]
+        dates = rebalance_dates(
+            observed[0], last + pd.Timedelta(days=400), self.rebalance_frequency.lower(),
+            self.rebalance_shift_days, self.non_trading_day_adjustment, observed_sessions=observed,
+        )
+        self.rebalance_schedule = [pair for pair in dates if pair[1] <= last]
+        self._next_rebalance = next(pair for pair in dates if pair[1] > last)
 
     def set_rebalance_frequency(self, rebalance_frequency: str) -> None:
         self.rebalance_frequency = rebalance_frequency
         self._refresh_rebalance_schedule()
-
-    def _build_signal_dates(self) -> pd.Index:
-        frequency = self.rebalance_frequency.lower()
-        if frequency == "weekly":
-            grouped = self.close_prices.groupby(pd.Grouper(freq="W-FRI")).tail(1).index
-            original_dates = pd.Index(grouped)
-        elif frequency == "monthly":
-            grouped = self.close_prices.groupby(self.close_prices.index.to_period("M")).tail(1).index
-            original_dates = pd.Index(grouped)
-        elif frequency == "bimonthly":
-            grouped = self.close_prices.groupby(self.close_prices.index.to_period("M")).tail(1)
-            month_ends = grouped.index
-            month_numbers = month_ends.to_period("M").month
-            original_dates = pd.Index(month_ends[month_numbers % 2 == 0])
-        elif frequency == "quarterly":
-            grouped = self.close_prices.groupby(self.close_prices.index.to_period("Q")).tail(1).index
-            original_dates = pd.Index(grouped)
-        elif frequency == "semiannual":
-            grouped = self.close_prices.groupby(self.close_prices.index.to_period("Q")).tail(1)
-            quarter_ends = grouped.index
-            quarter_numbers = quarter_ends.to_period("Q").quarter
-            original_dates = pd.Index(quarter_ends[quarter_numbers.isin([2, 4])])
-        elif frequency == "annual":
-            grouped = self.close_prices.groupby(self.close_prices.index.to_period("Y")).tail(1).index
-            original_dates = pd.Index(grouped)
-        else:
-            raise ValueError(f"Unsupported rebalance frequency: {self.rebalance_frequency}")
-
-        # 미완성 기간은 기본적으로 제외한다. 다만 시프트된 기준일과
-        # 그 다음 거래일이 이미 데이터에 있는 경우에는 현재 기간도 포함한다.
-        incomplete_period_end: pd.Timestamp | None = None
-        if not original_dates.empty:
-            last_orig = original_dates[-1]
-            max_data_date = self.close_prices.index[-1]
-            if frequency == "weekly":
-                period_end = last_orig + pd.offsets.Week(0, weekday=4)
-            elif frequency in ["monthly", "bimonthly"]:
-                period_end = last_orig + pd.offsets.MonthEnd(0)
-            elif frequency in ["quarterly", "semiannual"]:
-                period_end = last_orig + pd.offsets.QuarterEnd(0)
-            elif frequency == "annual":
-                period_end = last_orig + pd.offsets.YearEnd(0)
-            else:
-                period_end = last_orig
-
-            if period_end > max_data_date:
-                if self.rebalance_shift_days > 0:
-                    shifted_target = period_end - pd.Timedelta(days=self.rebalance_shift_days)
-                    if shifted_target < max_data_date:
-                        incomplete_period_end = period_end
-                    else:
-                        original_dates = original_dates[:-1]
-                else:
-                    original_dates = original_dates[:-1]
-
-        if self.rebalance_shift_days == 0:
-            return original_dates
-
-        adjusted_dates = []
-        trading_days = self.close_prices.index
-        for d in original_dates:
-            if incomplete_period_end is not None and d == original_dates[-1]:
-                d = incomplete_period_end
-            target = d - pd.Timedelta(days=self.rebalance_shift_days)
-            if target in trading_days:
-                adjusted_dates.append(target)
-            else:
-                if self.non_trading_day_adjustment == "prior":
-                    prior_days = trading_days[trading_days < target]
-                    if not prior_days.empty:
-                        adjusted_dates.append(prior_days[-1])
-                    else:
-                        following_days = trading_days[trading_days > target]
-                        if not following_days.empty:
-                            adjusted_dates.append(following_days[0])
-                elif self.non_trading_day_adjustment == "following":
-                    following_days = trading_days[trading_days > target]
-                    if not following_days.empty:
-                        adjusted_dates.append(following_days[0])
-                    else:
-                        prior_days = trading_days[trading_days < target]
-                        if not prior_days.empty:
-                            adjusted_dates.append(prior_days[-1])
-                elif self.non_trading_day_adjustment == "nearest":
-                    idx = trading_days.get_indexer([target], method="nearest")[0]
-                    adjusted_dates.append(trading_days[idx])
-                else:
-                    adjusted_dates.append(target)
-
-        adjusted_dates = sorted(list(set(adjusted_dates)))
-        return pd.Index(adjusted_dates)
 
     def _benchmark_uptrend(self, date: pd.Timestamp) -> bool:
         benchmark_price = self.close_prices.at[date, self.benchmark_ticker]
         benchmark_sma = self.sma_200.at[date, self.benchmark_ticker]
         return pd.notna(benchmark_price) and pd.notna(benchmark_sma) and benchmark_price > benchmark_sma
 
+    def _max_drawdown_126(self, date: pd.Timestamp, tickers) -> pd.Series:
+        window = self.close_prices.loc[:date].tail(126).loc[:, tickers]
+        drawdowns = window.div(window.cummax()).sub(1.0)
+        return drawdowns.min().where(window.count() == 126)
+
     def score_strategy(self, strategy_name: str, date: pd.Timestamp) -> pd.Series:
         universe = self.universe
         if strategy_name == "hybrid_strategy":
-            combined_rank = pd.Series(0.0, index=universe)
-            total_weight = 0.0
+            ranked_factors = []
             for sub_name, weight in self.hybrid_weights.items():
                 if weight <= 0:
                     continue
-                sub_score = self.score_strategy(sub_name, date)
-                if sub_score.empty:
-                    continue
-                sub_rank = sub_score.rank(pct=True)
-                combined_rank = combined_rank.add(sub_rank * weight, fill_value=0.0)
-                total_weight += weight
-            if total_weight > 0:
-                return combined_rank / total_weight
-            return pd.Series(0.0, index=universe)
-        ret_21 = self.ret_21.loc[date, universe]
+                sub_score = self.score_strategy(sub_name, date).replace([np.inf, -np.inf], np.nan)
+                ranked_factors.append(sub_score.rank(pct=True) * weight)
+            if not ranked_factors:
+                return pd.Series(dtype=float)
+            ranks = pd.concat(ranked_factors, axis=1)
+            return ranks.sum(axis=1, skipna=False) / sum(w for w in self.hybrid_weights.values() if w > 0)
         ret_63 = self.ret_63.loc[date, universe]
         ret_126 = self.ret_126.loc[date, universe]
         ret_252 = self.ret_252.loc[date, universe]
@@ -280,7 +209,12 @@ class MonthlyBacktester:
         if strategy_name == "momentum_12m":
             return ret_252.where(eligibility_mask)
         if strategy_name == "momentum_12m_skip_1m":
-            return (ret_252 - ret_21).where(eligibility_mask)
+            pos = self.close_prices.index.get_loc(date)
+            if pos < 252:
+                return pd.Series(dtype=float)
+            prior_close = self.close_prices.iloc[pos - 21][universe]
+            start_close = self.close_prices.iloc[pos - 252][universe]
+            return (prior_close / start_close - 1).where(eligibility_mask)
         if strategy_name == "risk_adjusted_momentum":
             return (ret_252 / vol_63).where(eligibility_mask)
         if strategy_name == "low_vol_momentum":
@@ -303,7 +237,7 @@ class MonthlyBacktester:
         if strategy_name == "high_liquidity":
             return dollar_volume_21.where(eligibility_mask)
         if strategy_name == "min_drawdown":
-            return drawdown_126.where(eligibility_mask)
+            return self._max_drawdown_126(date, universe).where(eligibility_mask)
         raise ValueError(f"Unknown strategy: {strategy_name}")
 
     def select_target_tickers(
@@ -313,6 +247,7 @@ class MonthlyBacktester:
         top_n: int,
     ) -> tuple[list[str], pd.Series]:
         score = self.score_strategy(strategy.name, date)
+        score = score.where(self.close_prices.loc[date].notna())
         score = score.replace([np.inf, -np.inf], np.nan).dropna().sort_values(ascending=False)
         if strategy.name in {"drawdown_filtered_momentum"}:
             score = score[score > 0]
@@ -325,7 +260,6 @@ class MonthlyBacktester:
         target_shares: pd.Series,
         price_row: pd.Series,
     ) -> tuple[float, pd.Series, pd.Series, float, float, float]:
-        price_row = price_row.fillna(0.0)
         share_delta = (target_shares - current_shares).astype(int)
         buy_shares = share_delta.clip(lower=0)
         sell_shares = (-share_delta).clip(lower=0)
@@ -433,9 +367,9 @@ class MonthlyBacktester:
         current_shares: pd.Series,
         current_cash: float,
     ) -> tuple[pd.Series, pd.Series, float, pd.Series, pd.Series, float, float, float]:
-        target_shares = pd.Series(0, index=self.universe, dtype=int)
+        target_shares = current_shares.where(price_row.isna(), 0).copy()
         selected_prices = price_row.reindex(selected).dropna()
-        selected_prices = selected_prices[selected_prices > 0]
+        selected_prices = selected_prices[target_weights.reindex(selected_prices.index).fillna(0) > 0]
         if selected_prices.empty or total_equity <= 0:
             cash_after, buy_shares, sell_shares, buy_notional, sell_notional, fees = (
                 self._evaluate_cash_after_trade(current_shares, current_cash, target_shares, price_row)
@@ -451,11 +385,8 @@ class MonthlyBacktester:
                 fees,
             )
 
-        normalized_weights = target_weights.reindex(selected_prices.index).fillna(0.0)
-        if float(normalized_weights.sum()) <= 0:
-            normalized_weights = pd.Series(1.0 / len(selected_prices), index=selected_prices.index, dtype=float)
-        else:
-            normalized_weights = normalized_weights / normalized_weights.sum()
+        normalized_weights = target_weights.loc[selected_prices.index]
+        normalized_weights = normalized_weights / normalized_weights.sum()
         desired_values = total_equity * normalized_weights
         seed_shares = np.floor(desired_values / selected_prices).astype(int)
         target_shares.loc[selected_prices.index] = seed_shares
@@ -484,7 +415,7 @@ class MonthlyBacktester:
             self._evaluate_cash_after_trade(current_shares, current_cash, target_shares, price_row)
         )
         while cash_after < -1e-9:
-            invested = target_shares[target_shares > 0].index
+            invested = target_shares[(target_shares > 0) & price_row.notna()].index
             if invested.empty:
                 break
             invested_values = target_shares.loc[invested] * price_row.loc[invested]
@@ -519,88 +450,53 @@ class MonthlyBacktester:
         current_cash: float,
         cash_contribution: float = 0.0,
     ) -> tuple[pd.Series, float, list[dict[str, object]], list[dict[str, object]], dict[str, object]]:
-        if self.current_year is None or signal_date.year != self.current_year:
+        if effective_date.year != self.current_year:
             self.annual_realized_pnl = 0.0
-            self.current_year = signal_date.year
+            self.current_year = effective_date.year
 
-        is_last_of_year = True
-        for next_sig, next_eff in self.rebalance_schedule[rebalance_no:]:
-            if next_sig.year == signal_date.year:
-                is_last_of_year = False
-                break
-
-        execution_price_row = self.trade_prices.loc[effective_date].fillna(0.0)
-        close_price_row = self.close_prices.loc[effective_date, self.universe].fillna(0.0)
-        portfolio_value_before_contribution = float((current_shares * execution_price_row).sum() + current_cash)
+        next_execution = self._next_rebalance[1]
+        if rebalance_no < len(self.rebalance_schedule):
+            next_execution = self.rebalance_schedule[rebalance_no][1]
+        is_last_of_year = next_execution.year > effective_date.year
+        execution_price_row = self.trade_prices.loc[effective_date]
+        close_price_row = self.valuation_prices.loc[effective_date]
+        locked_value = float((current_shares * self.valuation_prices.loc[signal_date]).where(execution_price_row.isna()).sum())
+        tradable_value = float((current_shares * execution_price_row).sum() + current_cash)
+        portfolio_value_before_contribution = tradable_value + locked_value
         current_cash = float(current_cash + cash_contribution)
-        portfolio_value_before = float((current_shares * execution_price_row).sum() + current_cash)
+        tradable_value += cash_contribution
+        portfolio_value_before = tradable_value + locked_value
         target_weights = self._build_target_weights(strategy=strategy, selected=selected, signal_date=signal_date)
 
-        # 연도 최종 거래일 세금 가예측 (Pass 1)
-        estimated_tax = 0.0
-        if is_last_of_year:
-            temp_target_shares, _, _, _, _, _, _, _ = self._build_target_shares(
-                selected=selected,
-                target_weights=target_weights,
-                price_row=execution_price_row,
-                total_equity=portfolio_value_before,
-                current_shares=current_shares,
-                current_cash=current_cash,
+        # Reserve only the tax owed on the sales that will actually execute.
+        reserve = 0.0
+        while True:
+            (target_shares, normalized_weights, cash_after, buy_shares, sell_shares,
+             buy_notional, sell_notional, fees) = self._build_target_shares(
+                selected=selected, target_weights=target_weights, price_row=execution_price_row,
+                total_equity=tradable_value - reserve, current_shares=current_shares,
+                current_cash=current_cash - reserve,
             )
-            # 임시 매도로 인한 실현손익 계산
-            temp_realized_pnl = 0.0
-            temp_share_delta = temp_target_shares - current_shares
-            for ticker in temp_share_delta.index:
-                delta = int(temp_share_delta.at[ticker])
-                if delta < 0:
-                    shares = abs(delta)
-                    price = float(execution_price_row.at[ticker])
-                    notional = shares * price
-                    prev_cost = float(self.average_costs.get(ticker, 0.0))
-                    if prev_cost > 0:
-                        temp_realized_pnl += (notional - (shares * prev_cost))
-            
-            estimated_annual_pnl = self.annual_realized_pnl + temp_realized_pnl
-            tax_free_limit = 2000.0
-            if estimated_annual_pnl > tax_free_limit:
-                estimated_tax = (estimated_annual_pnl - tax_free_limit) * 0.22
+            traded_notional = buy_notional + sell_notional
+            turnover = traded_notional / portfolio_value_before if portfolio_value_before > 0 else 0.0
+            skipped_by_turnover = 0 < turnover < strategy.min_turnover and reserve <= current_cash
+            if skipped_by_turnover:
+                target_shares = current_shares.copy()
+                buy_shares = sell_shares = pd.Series(0, index=self.universe, dtype=int)
+                buy_notional = sell_notional = fees = traded_notional = turnover = 0.0
+                cash_after = current_cash - reserve
 
-        # 세금 선공제 조정 (Pass 2)
-        tax = estimated_tax
-        equity_for_allocation = portfolio_value_before - tax
-        current_cash_for_allocation = current_cash - tax
-
-        (
-            target_shares,
-            target_weights,
-            cash_after,
-            buy_shares,
-            sell_shares,
-            buy_notional,
-            sell_notional,
-            fees,
-        ) = self._build_target_shares(
-            selected=selected,
-            target_weights=target_weights,
-            price_row=execution_price_row,
-            total_equity=equity_for_allocation,
-            current_shares=current_shares,
-            current_cash=current_cash_for_allocation,
-        )
-        traded_notional = buy_notional + sell_notional
-        turnover = traded_notional / portfolio_value_before if portfolio_value_before > 0 else 0.0
-        skipped_by_turnover = False
-        if traded_notional > 0 and turnover < strategy.min_turnover:
-            skipped_by_turnover = True
-            target_shares = current_shares.copy()
-            cash_after = float(current_cash)
-            buy_shares = pd.Series(0, index=self.universe, dtype=int)
-            sell_shares = pd.Series(0, index=self.universe, dtype=int)
-            buy_notional = 0.0
-            sell_notional = 0.0
-            fees = 0.0
-            traded_notional = 0.0
-            turnover = 0.0
+            tax = 0.0
+            if is_last_of_year:
+                costs = pd.Series(self.average_costs, dtype=float)
+                realized = (sell_shares * (execution_price_row - costs.where(costs > 0))).sum()
+                tax = max(0.0, self.annual_realized_pnl + realized - 2000.0) * 0.22
+            available_cash = cash_after + reserve
+            if available_cash + 1e-9 >= tax or reserve >= tax:
+                cash_after = available_cash - tax
+                break
+            reserve = tax
+        target_weights = normalized_weights
         portfolio_value_after = float((target_shares * close_price_row).sum() + cash_after)
 
         trade_rows: list[dict[str, object]] = []
@@ -657,7 +553,7 @@ class MonthlyBacktester:
                     "price": price,
                     "notional": notional,
                     "fee": fee,
-                    "allocation_mode": strategy.allocation_mode,
+                    "allocation_mode": self.allocation_mode_override or strategy.allocation_mode,
                     "pre_shares": pre_shares,
                     "post_shares": post_shares,
                     "purchase_price": purchase_price,
@@ -693,7 +589,7 @@ class MonthlyBacktester:
                     "market_value": market_value,
                     "weight": weight,
                     "target_weight": float(target_weights.get(ticker, 0.0)),
-                    "allocation_mode": strategy.allocation_mode,
+                    "allocation_mode": self.allocation_mode_override or strategy.allocation_mode,
                     "cash_contribution": cash_contribution,
                     "cash_after": cash_after,
                     "total_equity": total_equity,
@@ -715,7 +611,7 @@ class MonthlyBacktester:
                 "market_value": cash_after,
                 "weight": cash_after / total_equity if total_equity > 0 else 0.0,
                 "target_weight": np.nan,
-                "allocation_mode": strategy.allocation_mode,
+                "allocation_mode": self.allocation_mode_override or strategy.allocation_mode,
                 "cash_contribution": cash_contribution,
                 "cash_after": cash_after,
                 "total_equity": total_equity,
@@ -725,7 +621,7 @@ class MonthlyBacktester:
 
         rebalance_row = {
             "strategy": strategy.name,
-            "allocation_mode": strategy.allocation_mode,
+            "allocation_mode": self.allocation_mode_override or strategy.allocation_mode,
             "rebalance_frequency": self.rebalance_frequency,
             "top_n": top_n,
             "rebalance_no": rebalance_no,
@@ -807,9 +703,9 @@ class MonthlyBacktester:
             cash_series,
             contribution_series,
             rankings,
-            pd.DataFrame(trade_rows),
-            pd.DataFrame(portfolio_rows),
-            pd.DataFrame(rebalance_rows),
+            pd.DataFrame(trade_rows, columns=None if trade_rows else ["rebalance_no"]),
+            pd.DataFrame(portfolio_rows, columns=None if portfolio_rows else ["rebalance_no"]),
+            pd.DataFrame(rebalance_rows, columns=None if rebalance_rows else ["rebalance_no"]),
         )
 
     def run(self, strategy: Strategy, top_n: int) -> StrategyRun:
@@ -825,7 +721,7 @@ class MonthlyBacktester:
             portfolio_history,
             rebalance_summary,
         ) = self._execute_schedule(strategy=strategy, top_n=top_n, schedule=self.rebalance_schedule)
-        holdings_value_close = shares_history.astype(float) * self.close_prices[self.universe]
+        holdings_value_close = shares_history.astype(float) * self.valuation_prices
         total_equity = holdings_value_close.sum(axis=1) + cash_series
         daily_returns = self._cash_flow_adjusted_returns(total_equity, contribution_series)
         equity_curve = (1.0 + daily_returns).cumprod()
@@ -909,6 +805,9 @@ class MonthlyBacktester:
             max_drawdown=float(max_drawdown),
             avg_monthly_turnover=avg_monthly_turnover,
             rebalance_count=rebalance_count,
+            rebalance_shift_days=self.rebalance_shift_days,
+            next_signal_date=self._next_rebalance[0].date().isoformat(),
+            next_effective_date=self._next_rebalance[1].date().isoformat(),
         )
 
     def benchmark_equity(self) -> pd.Series:
@@ -920,7 +819,7 @@ class MonthlyBacktester:
     def latest_holdings(self, run: StrategyRun) -> pd.DataFrame:
         latest_date = run.shares_history.index[-1]
         shares = run.shares_history.loc[latest_date]
-        prices = self.close_prices.loc[latest_date, self.universe]
+        prices = self.valuation_prices.loc[latest_date]
         values = (shares * prices).astype(float)
         cash_value = float(run.cash_series.loc[latest_date])
         total_equity = float(values.sum() + cash_value)
@@ -956,6 +855,7 @@ class MonthlyBacktester:
         latest_date = self.close_prices.index[-1]
         selected, score = self.select_target_tickers(strategy=strategy, date=latest_date, top_n=top_n)
         frame = pd.DataFrame({"ticker": score.index, "score": score.values})
+        frame["target_weight"] = frame["ticker"].map(self._build_target_weights(strategy, selected, latest_date)).fillna(0.0)
         if frame.empty:
             return latest_date, frame
         frame["latest_price"] = self.close_prices.loc[latest_date, frame["ticker"]].values
@@ -965,20 +865,12 @@ class MonthlyBacktester:
         frame["ret_12m"] = self.ret_252.loc[latest_date, frame["ticker"]].values
         frame["vol_3m"] = self.vol_63.loc[latest_date, frame["ticker"]].values
         frame["rel_volume_1m"] = self.rel_volume_21.loc[latest_date, frame["ticker"]].values
-        frame["drawdown_6m"] = self.drawdown_126.loc[latest_date, frame["ticker"]].values
+        frame["drawdown_6m"] = frame["ticker"].map(self._max_drawdown_126(latest_date, frame["ticker"]))
         frame["selected"] = frame["ticker"].isin(selected)
         return latest_date, frame.head(max(top_n, 20)).reset_index(drop=True)
 
     def get_next_scheduled_rebalance(self) -> tuple[pd.Timestamp, pd.Timestamp]:
-        latest_market_date = self.close_prices.index[-1]
-        return calculate_next_rebalance_date(
-            latest_market_date=latest_market_date,
-            rebalance_frequency=self.rebalance_frequency,
-            rebalance_shift_days=self.rebalance_shift_days,
-            non_trading_day_adjustment=self.non_trading_day_adjustment,
-        )
-
-
+        return self._next_rebalance
 
 
 def evaluate_strategies(
@@ -1010,6 +902,16 @@ def evaluate_strategies(
     return runs
 
 
+def build_equity_curves(backtester: MonthlyBacktester, runs: list[StrategyRun]) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            f"{run.strategy.name}_{run.rebalance_frequency}_n{run.top_n}": run.equity_curve
+            for run in runs
+        }
+        | {"spy_buy_and_hold": backtester.benchmark_equity()}
+    )
+
+
 def save_result_artifacts(
     backtester: MonthlyBacktester,
     runs: list[StrategyRun],
@@ -1032,13 +934,7 @@ def save_result_artifacts(
     )
     top_n_summary.to_csv(output_dir / "top_n_summary.csv", index=False)
 
-    equity_curves = pd.DataFrame(
-        {
-            f"{run.strategy.name}_{run.rebalance_frequency}_n{run.top_n}": run.equity_curve
-            for run in runs
-        }
-        | {"spy_buy_and_hold": backtester.benchmark_equity()}
-    )
+    equity_curves = build_equity_curves(backtester, runs)
     equity_curves.to_csv(output_dir / "equity_curves.csv")
 
     plt.figure(figsize=(13, 8))
@@ -1080,94 +976,3 @@ def save_result_artifacts(
     best_run.rebalance_summary.to_csv(output_dir / "rebalance_summary.csv", index=False)
 
     return summary, top_n_summary, best_run
-
-
-def calculate_next_rebalance_date(
-    latest_market_date: pd.Timestamp,
-    rebalance_frequency: str,
-    rebalance_shift_days: int,
-    non_trading_day_adjustment: str = "prior",
-) -> tuple[pd.Timestamp, pd.Timestamp]:
-    future_index = pd.bdate_range(
-        start=latest_market_date - pd.Timedelta(days=45),
-        end=latest_market_date + pd.Timedelta(days=450)
-    )
-    temp_close = pd.DataFrame(index=future_index)
-    
-    frequency = rebalance_frequency.lower()
-    if frequency == "weekly":
-        grouped = temp_close.groupby(pd.Grouper(freq="W-FRI")).tail(1).index
-        original_dates = pd.Index(grouped)
-    elif frequency == "monthly":
-        grouped = temp_close.groupby(temp_close.index.to_period("M")).tail(1).index
-        original_dates = pd.Index(grouped)
-    elif frequency == "bimonthly":
-        grouped = temp_close.groupby(temp_close.index.to_period("M")).tail(1)
-        month_ends = grouped.index
-        month_numbers = month_ends.to_period("M").month
-        original_dates = pd.Index(month_ends[month_numbers % 2 == 0])
-    elif frequency == "quarterly":
-        grouped = temp_close.groupby(temp_close.index.to_period("Q")).tail(1).index
-        original_dates = pd.Index(grouped)
-    elif frequency == "semiannual":
-        grouped = temp_close.groupby(temp_close.index.to_period("Q")).tail(1)
-        quarter_ends = grouped.index
-        quarter_numbers = quarter_ends.to_period("Q").quarter
-        original_dates = pd.Index(quarter_ends[quarter_numbers.isin([2, 4])])
-    elif frequency == "annual":
-        grouped = temp_close.groupby(temp_close.index.to_period("Y")).tail(1).index
-        original_dates = pd.Index(grouped)
-    else:
-        original_dates = pd.Index([latest_market_date])
-
-    if rebalance_shift_days == 0:
-        adjusted_dates = original_dates
-    else:
-        adjusted_dates = []
-        trading_days = temp_close.index
-        for d in original_dates:
-            target = d - pd.Timedelta(days=rebalance_shift_days)
-            if target in trading_days:
-                adjusted_dates.append(target)
-            else:
-                if non_trading_day_adjustment == "prior":
-                    prior_days = trading_days[trading_days < target]
-                    if not prior_days.empty:
-                        adjusted_dates.append(prior_days[-1])
-                    else:
-                        following_days = trading_days[trading_days > target]
-                        if not following_days.empty:
-                            adjusted_dates.append(following_days[0])
-                elif non_trading_day_adjustment == "following":
-                    following_days = trading_days[trading_days > target]
-                    if not following_days.empty:
-                        adjusted_dates.append(following_days[0])
-                    else:
-                        prior_days = trading_days[trading_days < target]
-                        if not prior_days.empty:
-                            adjusted_dates.append(prior_days[-1])
-                elif non_trading_day_adjustment == "nearest":
-                    idx = trading_days.get_indexer([target], method="nearest")[0]
-                    adjusted_dates.append(trading_days[idx])
-                else:
-                    adjusted_dates.append(target)
-
-        adjusted_dates = sorted(list(set(adjusted_dates)))
-
-    next_signal = None
-    for sd in adjusted_dates:
-        if sd > latest_market_date:
-            next_signal = sd
-            break
-
-    if next_signal is None:
-        next_signal = latest_market_date + pd.Timedelta(days=30)
-
-    trading_days = temp_close.index
-    idx = trading_days.get_loc(next_signal)
-    if idx + 1 < len(trading_days):
-        next_effective = trading_days[idx + 1]
-    else:
-        next_effective = next_signal + pd.Timedelta(days=1)
-
-    return next_signal, next_effective

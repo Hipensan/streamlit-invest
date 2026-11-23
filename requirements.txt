@@ -1,4 +1,4 @@
-streamlit
+streamlit>=1.46
 plotly
 pandas
 numpy
@@ -8,3 +8,4 @@ yfinance
 lxml
 pyarrow
 scipy
+exchange-calendars>=4.8,<5

@@ -364,7 +364,7 @@ def test_rebalance_shift_and_adjustment() -> None:
         non_trading_day_adjustment="prior",
     )
 
-    signal_dates = backtester._build_signal_dates()
+    signal_dates = [signal for signal, _ in backtester.rebalance_schedule]
     # 2023-01-31 is the last trading day of Jan 2023.
     # 7 days earlier is 2023-01-24, which we removed.
     # The prior trading day should be 2023-01-23 (Monday).
@@ -413,6 +413,65 @@ def test_shifted_rebalance_in_incomplete_month_is_not_included_before_signal_dat
 
     assert all(signal_date < pd.Timestamp("2026-09-01") for signal_date, _ in backtester.rebalance_schedule)
 
+
+def test_pending_holiday_execution_is_persisted_and_then_logged(tmp_path) -> None:
+    from rebalance_lab.backtest import calculate_next_rebalance_date, save_result_artifacts
+
+    signal, execution = pd.Timestamp("2025-12-31"), pd.Timestamp("2026-01-02")
+    index = pd.bdate_range("2025-08-01", execution).difference([pd.Timestamp("2026-01-01")])
+    prices = pd.DataFrame({"AAA": np.arange(len(index)) + 100, "SPY": 100}, index=index)
+    strategy = Strategy(name="momentum_3m", description="test")
+
+    def run_until(end):
+        close = prices.loc[:end]
+        engine = MonthlyBacktester(close * 0.99, close, None, ["AAA"], rebalance_shift_days=0,
+                                   rebalance_contribution=1000)
+        return engine, engine.run(strategy, top_n=1)
+
+    engine, pending = run_until(signal)
+    assert calculate_next_rebalance_date(signal, "monthly", 0) == (signal, execution)
+    assert engine.get_next_scheduled_rebalance() == (signal, execution)
+    assert (signal, execution) not in engine.rebalance_schedule
+    save_result_artifacts(engine, [pending], tmp_path)
+    saved = pd.read_csv(tmp_path / "backtest_summary.csv").iloc[0]
+    assert (saved.next_signal_date, saved.next_effective_date) == ("2025-12-31", "2026-01-02")
+    assert saved.rebalance_shift_days == 0
+
+    engine, completed = run_until(execution)
+    assert engine.rebalance_schedule[-1] == (signal, execution)
+    row = completed.rebalance_summary.iloc[-1]
+    assert (row.signal_date, row.effective_date) == (saved.next_signal_date, saved.next_effective_date)
+    trades = completed.trade_log[completed.trade_log.rebalance_no == row.rebalance_no]
+    assert len(trades) > 0 and (trades.effective_date == saved.next_effective_date).all()
+    assert engine.get_next_scheduled_rebalance()[0] > execution
+
+
+def test_month_end_anchor_is_stable_as_new_prices_arrive() -> None:
+    index = pd.bdate_range("2026-06-01", "2026-11-02")
+    prices = pd.DataFrame({"AAA": 100, "SPY": 100}, index=index)
+    expected = (pd.Timestamp("2026-09-30"), pd.Timestamp("2026-10-01"))
+    for cutoff in ("2026-09-30", "2026-10-02", "2026-11-02"):
+        frame = prices.loc[:cutoff]
+        engine = MonthlyBacktester(frame, frame, None, ["AAA"], rebalance_shift_days=30)
+        if frame.index[-1] < expected[1]:
+            assert engine.get_next_scheduled_rebalance() == expected
+        else:
+            assert [pair for pair in engine.rebalance_schedule if pair[0].month in (9, 10)
+                    and pair[0] <= pd.Timestamp("2026-10-02")] == [expected]
+
+
+
+def test_price_cache_limits_all_frames_to_requested_trading_days(tmp_path) -> None:
+    index = pd.bdate_range("2024-02-26", "2024-03-08")
+    prices = pd.DataFrame({"AAA": range(1, len(index) + 1)}, index=index)
+    cache_path = tmp_path / "prices.parquet"
+    bundle = PriceBundle(prices, prices, prices)
+    data_module._bundle_to_cache_frame(bundle).to_parquet(cache_path)
+
+    loaded = data_module.load_or_refresh_price_cache(["AAA"], "2024-02-29", "2024-03-02", cache_path)
+    for frame in (loaded.open_prices, loaded.close_prices, loaded.volume_prices):
+        assert list(frame.index) == [pd.Timestamp("2024-02-29"), pd.Timestamp("2024-03-01")]
+    assert len(pd.read_parquet(cache_path)) == len(index)
 
 
 def test_price_cache_refreshes_when_requested_range_is_not_covered(monkeypatch) -> None:

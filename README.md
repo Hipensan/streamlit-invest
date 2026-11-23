@@ -1,6 +1,10 @@
-# Monthly Rebalancing Lab
+# 퀀트 투자 연구소
 
-This CLI project compares monthly stock rebalancing strategies under the same rules, then generates the latest stock recommendations from the best-performing strategy.
+Streamlit 상단 메뉴에서 세 가지 투자 도구를 사용할 수 있습니다.
+
+- **리밸런싱 연구실**에서 전략과 주기별 백테스트, 추천 종목, 매수 계획과 거래 내역을 확인합니다. 백테스트 기간은 기본적으로 실행일 기준 최근 10년이며, 최근 1·3·5년 또는 직접 지정으로 변경할 수 있습니다. 종료일을 지정하면 해당 날짜를 기준으로 계산합니다.
+- **종목 비교**에서 저장된 가격 데이터의 종목을 선택하고 공통 거래일 기준으로 누적 수익률과 최대 낙폭을 비교합니다. 가격 데이터는 연구실의 가격 캐시를 갱신할 때 업데이트됩니다.
+- **적립식 시뮬레이터**에서 초기 투자금, 월 납입액, 가정 연 수익률과 투자 기간에 따른 원금과 자산 추이를 살펴봅니다.
 
 ## Run
 
@@ -54,13 +58,16 @@ python run_pipeline.py --force-refresh
 
 ## Simulation Rules
 
-- Signals are computed on the last trading day of each chosen rebalance period and traded on the next trading day's open.
+- Each period is anchored to its final NYSE trading session. The configured shift subtracts calendar days, with the default holiday adjustment moving the signal to the preceding session. Signals use the close and trades use the next session's open. The summary stores the next pending signal and execution dates for each run.
 - Rebalance frequency is configurable: `weekly`, `monthly`, `bimonthly`, `quarterly`, `semiannual`, `annual`.
 - Strategies can be filtered in the Streamlit sidebar or with `--strategies` in the CLI.
 - Optional cash contributions can be added immediately before every scheduled rebalance.
 - Shares are integer-only. Fractional shares are not allowed.
 - The allocator aims for near-equal dollar exposure across selected names and keeps leftover cash when exact equality is impossible.
 - Trade logs include buy/sell price, share count, notional, and fee.
+- A missing or invalid opening price freezes that stock's shares for the rebalance. Holdings use the latest valid close for valuation, or that session's open if the close is missing.
+- The simulation settles its annual tax assumption on the last scheduled execution of the calendar year, using realized sales. Ending a backtest earlier leaves that year's settlement pending.
+- Hybrid strategies require a valid score for every positively weighted factor. Saved recommendations include the strategy's target weights, and the dashboard exports the portfolio and trade logs of the selected run.
 - The Streamlit app includes a buy-plan tab where you can enter your current capital and see how many shares to buy for the current model portfolio.
 
 ## Caveats

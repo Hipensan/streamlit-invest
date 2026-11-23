@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from rebalance_lab.backtest import CONTROL_TICKERS, MonthlyBacktester, evaluate_strategies, save_result_artifacts
+from rebalance_lab.backtest import CONTROL_TICKERS, MonthlyBacktester, build_equity_curves, evaluate_strategies, save_result_artifacts
 from rebalance_lab.data import fetch_sp500_snapshot, load_or_refresh_price_cache, persist_universe_snapshot
 from rebalance_lab.planner import build_purchase_plan
 from rebalance_lab.strategies import build_strategy_library
 from run_pipeline import build_eligibility_map
+from quant_tools import render_asset_comparison, render_contribution_simulator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -24,7 +25,7 @@ def cached_fetch_sp500_snapshot():
     return fetch_sp500_snapshot()
 
 
-@st.cache_resource(show_spinner="주가 가격 정보를 로드하고 있습니다...")
+@st.cache_resource(show_spinner="주가 가격 정보를 로드하고 있습니다...", ttl=3600, max_entries=2)
 def cached_load_or_refresh_price_cache(tickers, start, end, cache_path, force_refresh):
     if force_refresh:
         st.cache_resource.clear()
@@ -46,9 +47,14 @@ def ensure_rebalance_frequency_column(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def parse_top_n_text(raw: str) -> list[int]:
-    values = sorted({int(part.strip()) for part in raw.split(",") if part.strip()})
+    try:
+        values = sorted({int(part.strip()) for part in raw.split(",") if part.strip()})
+    except ValueError:
+        raise ValueError("Top N에는 1 이상의 정수를 쉼표로 구분해 입력하세요.") from None
     if not values:
         raise ValueError("Top N 값을 하나 이상 입력해야 합니다.")
+    if values[0] < 1:
+        raise ValueError("Top N은 1 이상의 정수여야 합니다.")
     return values
 
 
@@ -84,6 +90,22 @@ def selected_strategy_names_from_checkboxes() -> list[str]:
     return selected
 
 
+def render_backtest_period(today: date) -> tuple[date, date]:
+    periods = {"최근 1년": 1, "최근 3년": 3, "최근 5년": 5, "최근 10년": 10, "직접 지정": None}
+    period = st.selectbox("백테스트 기간", list(periods), index=3)
+    if st.checkbox("종료일 지정", value=False):
+        end = st.date_input("종료일", value=today, min_value=date(1900, 1, 1), max_value=today)
+    else:
+        end = today
+    years = periods[period]
+    if years is None:
+        start = st.date_input("시작일", value=date(2014, 1, 1), min_value=date(1900, 1, 1), max_value=today)
+    else:
+        start = (pd.Timestamp(end) - pd.DateOffset(years=years)).date()
+    st.caption(f"다음 실행 기간 · {start:%Y-%m-%d} ~ {end:%Y-%m-%d}")
+    return start, end
+
+
 def run_backtest(
     *,
     start: str,
@@ -99,6 +121,9 @@ def run_backtest(
     allocation_override: str | None = None,
     hybrid_weights: dict[str, float] | None = None,
 ) -> dict[str, object]:
+    last_day = date.fromisoformat(end) if end else pd.Timestamp.now(tz="Asia/Seoul").date()
+    if date.fromisoformat(start) >= last_day:
+        raise ValueError("시작일은 종료일보다 앞서야 합니다.")
     universe_snapshot = cached_fetch_sp500_snapshot()
     persist_universe_snapshot(universe_snapshot, OUTPUT_DIR / "sp500_snapshot.csv")
 
@@ -106,13 +131,16 @@ def run_backtest(
     price_bundle = cached_load_or_refresh_price_cache(
         tickers=tickers,
         start=start,
-        end=end,
+        # The download API excludes its end date. The date selected in the UI is inclusive.
+        end=(last_day + timedelta(days=1)).isoformat(),
         cache_path=CACHE_DIR / "price_history.parquet",
         force_refresh=force_refresh,
     )
     open_prices = price_bundle.open_prices
     close_prices = price_bundle.close_prices
     volume_prices = price_bundle.volume_prices
+    if len(close_prices) < 2 or close_prices.empty:
+        raise ValueError("선택한 기간에 가격 데이터가 있는 거래일이 부족합니다. 기간을 변경해 주세요.")
     available_universe = [ticker for ticker in universe_snapshot.tickers if ticker in close_prices.columns]
     open_prices = open_prices.loc[:, available_universe + CONTROL_TICKERS]
     close_prices = close_prices.loc[:, available_universe + CONTROL_TICKERS]
@@ -142,21 +170,7 @@ def run_backtest(
     )
     summary, top_n_summary, best_run = save_result_artifacts(backtester, runs, OUTPUT_DIR)
 
-    summary = ensure_rebalance_frequency_column(summary)
-    top_n_summary = ensure_rebalance_frequency_column(top_n_summary)
-    equity_curves = pd.read_csv(OUTPUT_DIR / "equity_curves.csv", index_col=0, parse_dates=True)
-    current_holdings = pd.read_csv(OUTPUT_DIR / "current_model_portfolio.csv")
-    latest_recommendations = pd.read_csv(OUTPUT_DIR / "latest_recommendations.csv")
-    monthly_portfolio_history = ensure_rebalance_frequency_column(
-        pd.read_csv(OUTPUT_DIR / "monthly_portfolio_history.csv")
-    )
-    trade_log = ensure_rebalance_frequency_column(pd.read_csv(OUTPUT_DIR / "trade_log.csv"))
-    rebalance_summary = ensure_rebalance_frequency_column(pd.read_csv(OUTPUT_DIR / "rebalance_summary.csv"))
-    daily_signals = pd.read_csv(OUTPUT_DIR / "daily_signals.csv")
-    daily_action_summary = pd.read_csv(OUTPUT_DIR / "daily_signal_summary.csv")
-    daily_action_equity = pd.read_csv(OUTPUT_DIR / "daily_signal_equity.csv", parse_dates=["date"])
-
-    return {
+    results = {
         "requested_start": start,
         "requested_end": end,
         "rebalance_frequencies": rebalance_frequencies,
@@ -170,16 +184,9 @@ def run_backtest(
         "top_n_summary": top_n_summary,
         "best_run": best_run,
         "best_row": summary.iloc[0],
-        "equity_curves": equity_curves,
-        "current_holdings": current_holdings,
-        "latest_recommendations": latest_recommendations,
-        "monthly_portfolio_history": monthly_portfolio_history,
-        "trade_log": trade_log,
-        "rebalance_summary": rebalance_summary,
-        "daily_signals": daily_signals,
-        "daily_action_summary": daily_action_summary,
-        "daily_action_equity": daily_action_equity,
+        "equity_curves": build_equity_curves(backtester, runs),
     }
+    return materialize_selected_results(results, summary.iloc[0], best_run)
 
 
 def load_existing_outputs() -> dict[str, object] | None:
@@ -192,7 +199,6 @@ def load_existing_outputs() -> dict[str, object] | None:
         OUTPUT_DIR / "monthly_portfolio_history.csv",
         OUTPUT_DIR / "trade_log.csv",
         OUTPUT_DIR / "rebalance_summary.csv",
-        OUTPUT_DIR / "daily_signals.csv",
     ]
     if not all(path.exists() for path in required):
         return None
@@ -207,15 +213,7 @@ def load_existing_outputs() -> dict[str, object] | None:
     )
     trade_log = ensure_rebalance_frequency_column(pd.read_csv(OUTPUT_DIR / "trade_log.csv"))
     rebalance_summary = ensure_rebalance_frequency_column(pd.read_csv(OUTPUT_DIR / "rebalance_summary.csv"))
-    daily_signals = pd.read_csv(OUTPUT_DIR / "daily_signals.csv")
-    daily_action_summary_path = OUTPUT_DIR / "daily_signal_summary.csv"
-    daily_action_equity_path = OUTPUT_DIR / "daily_signal_equity.csv"
-    daily_action_summary = pd.read_csv(daily_action_summary_path) if daily_action_summary_path.exists() else pd.DataFrame()
-    daily_action_equity = (
-        pd.read_csv(daily_action_equity_path, parse_dates=["date"]) if daily_action_equity_path.exists() else pd.DataFrame()
-    )
-
-    latest_market_date = ""
+    latest_market_date = str(summary.iloc[0]["end_date"])
     if "as_of" in latest_recommendations.columns and not latest_recommendations.empty:
         latest_market_date = str(latest_recommendations["as_of"].iloc[0])
 
@@ -241,9 +239,6 @@ def load_existing_outputs() -> dict[str, object] | None:
         "monthly_portfolio_history": monthly_portfolio_history,
         "trade_log": trade_log,
         "rebalance_summary": rebalance_summary,
-        "daily_signals": daily_signals,
-        "daily_action_summary": daily_action_summary,
-        "daily_action_equity": daily_action_equity,
     }
 
 
@@ -352,7 +347,7 @@ def render_metric_strip(
             box-shadow: 0 14px 30px rgba(19,38,47,0.06);
             margin-bottom: 0.8rem;
         ">
-            <div style="font-size:0.9rem; color:#47606a; margin-bottom:0.35rem;">현재 최고 조합</div>
+            <div style="font-size:0.9rem; color:#47606a; margin-bottom:0.35rem;">선택한 조합</div>
             <div style="font-size:1.25rem; font-weight:700; color:#13262f; word-break:break-word;">
                 전략: {best_row["strategy"]}
             </div>
@@ -382,7 +377,9 @@ def render_metric_strip(
     if "total_contributions" in best_row and float(best_row["total_contributions"]) > 0:
         meta_parts.append(f"총 추가 납입: {num(float(best_row['total_contributions']))}")
     meta_parts.append(f"실제 성과 집계 구간: {best_row['start_date']} ~ {best_row['end_date']}")
-    meta_parts.append("신호 계산: 주기 말 종가 (종목 평가 및 비중 확정)")
+    if pd.notna(best_row.get("rebalance_shift_days")):
+        meta_parts.append(f"주기 마지막 거래일에서 {int(best_row['rebalance_shift_days'])}일 앞당김")
+    meta_parts.append("신호일 종가로 종목과 비중을 결정")
     meta_parts.append("실행 시점: 다음 거래일 시가 (매도/매수 동시 집행)")
     st.caption(" | ".join(meta_parts))
 
@@ -540,11 +537,11 @@ def render_rebalance_explorer(
         else:
             display_trades = trades.copy()
             if "purchase_price" not in display_trades.columns:
-                display_trades["purchase_price"] = np.nan
+                display_trades["purchase_price"] = float("nan")
             if "realized_pnl" not in display_trades.columns:
-                display_trades["realized_pnl"] = np.nan
+                display_trades["realized_pnl"] = float("nan")
             if "realized_pnl_pct" not in display_trades.columns:
-                display_trades["realized_pnl_pct"] = np.nan
+                display_trades["realized_pnl_pct"] = float("nan")
 
             display_trades["purchase_price"] = display_trades["purchase_price"].map(
                 lambda x: "" if pd.isna(x) else f"{float(x):,.2f}"
@@ -609,7 +606,7 @@ def render_recommendations(latest_recommendations: pd.DataFrame) -> None:
     if "as_of" in recommendations.columns:
         st.caption(
             f"신호 기준일: {recommendations['as_of'].iloc[0]} 종가 기준으로 종목을 평가합니다. "
-            "실제 포트폴리오 교체 주문(매도 및 매수)은 다음 거래일 시가에 동시에 집행됩니다."
+            "예정된 리밸런싱에서는 신호일 종가로 다시 평가하고 다음 거래일 시가에 모의 체결합니다."
         )
     display = recommendations[["ticker", "score", "latest_price", "ret_1m", "ret_3m", "ret_6m", "ret_12m", "selected"]].copy()
     display["score"] = display["score"].map(lambda x: f"{x:,.4f}")
@@ -632,19 +629,12 @@ def render_recommendations(latest_recommendations: pd.DataFrame) -> None:
 
 
 def build_signal_target_holdings(latest_recommendations: pd.DataFrame, top_n: int) -> pd.DataFrame:
-    recommendations = latest_recommendations.copy()
-    if recommendations.empty:
+    recommendations = latest_recommendations
+    if recommendations.empty or "target_weight" not in recommendations:
         return pd.DataFrame(columns=["ticker", "weight", "latest_price", "market_value"])
-    if "selected" in recommendations.columns:
-        selected = recommendations[recommendations["selected"] == True].copy()
-    else:
-        selected = recommendations.head(top_n).copy()
-    if selected.empty:
-        selected = recommendations.head(top_n).copy()
-    selected = selected.dropna(subset=["ticker", "latest_price"]).copy()
-    if selected.empty:
-        return pd.DataFrame(columns=["ticker", "weight", "latest_price", "market_value"])
-    selected["weight"] = 1.0 / len(selected)
+    selected = recommendations.loc[recommendations["selected"] & (recommendations["target_weight"] > 0)].head(top_n).copy()
+    selected = selected.dropna(subset=["ticker", "latest_price"])
+    selected["weight"] = selected["target_weight"]
     selected["market_value"] = selected["latest_price"]
     base = selected[["ticker", "weight", "latest_price", "market_value"]].reset_index(drop=True)
     cash_row = pd.DataFrame([{"ticker": "CASH", "weight": 0.0, "latest_price": 1.0, "market_value": 0.0}])
@@ -713,34 +703,31 @@ def render_buy_plan_section(
 
 
 
-def render_downloads() -> None:
+def render_downloads(results: dict[str, object]) -> None:
     st.subheader("파일 내려받기")
+    st.caption("전체 결과와 Top N 요약은 모든 조합을 포함합니다. 포트폴리오·추천·거래 내역은 화면에서 선택한 조합 기준입니다.")
     download_specs = [
-        ("backtest_summary.csv", "전체 결과 CSV"),
-        ("top_n_summary.csv", "Top N 요약 CSV"),
-        ("current_model_portfolio.csv", "현재 포트폴리오 CSV"),
-        ("latest_recommendations.csv", "최신 추천 CSV"),
-        ("monthly_portfolio_history.csv", "월별 포트폴리오 CSV"),
-        ("trade_log.csv", "매매 로그 CSV"),
-        ("rebalance_summary.csv", "리밸런싱 요약 CSV"),
+        ("backtest_summary.csv", "summary", "전체 결과 CSV"),
+        ("top_n_summary.csv", "top_n_summary", "Top N 요약 CSV"),
+        ("current_model_portfolio.csv", "current_holdings", "현재 포트폴리오 CSV"),
+        ("latest_recommendations.csv", "latest_recommendations", "최신 추천 CSV"),
+        ("monthly_portfolio_history.csv", "monthly_portfolio_history", "월별 포트폴리오 CSV"),
+        ("trade_log.csv", "trade_log", "매매 로그 CSV"),
+        ("rebalance_summary.csv", "rebalance_summary", "리밸런싱 요약 CSV"),
     ]
     cols = st.columns(3)
-    for index, (filename, label) in enumerate(download_specs):
-        path = OUTPUT_DIR / filename
-        if not path.exists():
-            continue
+    for index, (filename, result_key, label) in enumerate(download_specs):
         with cols[index % 3]:
             st.download_button(
                 label=label,
-                data=path.read_bytes(),
+                data=results[result_key].to_csv(index=False).encode("utf-8-sig"),
                 file_name=filename,
                 mime="text/csv",
                 use_container_width=True,
             )
 
 
-def main() -> None:
-    st.set_page_config(page_title="월별 리밸런싱 연구실", page_icon="chart_with_upwards_trend", layout="wide")
+def render_rebalance_lab() -> None:
     st.markdown(
         """
         <style>
@@ -774,13 +761,16 @@ def main() -> None:
 
     with st.sidebar:
         st.subheader("실행 설정")
-        start_value = st.date_input("시작일", value=date(2014, 1, 1))
-        end_enabled = st.checkbox("종료일 지정", value=False)
-        end_value = st.date_input("종료일", value=date.today(), disabled=not end_enabled)
-        top_n_text = st.text_input("Top N 목록", value="5,10,15,20,25,30")
+        start_value, end_value = render_backtest_period(pd.Timestamp.now(tz="Asia/Seoul").date())
+        top_n_text = st.text_input(
+            "Top N 목록",
+            value="5",
+            help="1 이상의 정수를 입력하세요. 여러 값을 비교하려면 쉼표로 구분하세요(예: 5, 10, 15, 20, 25, 30). "
+                 "각 리밸런싱에서 조건을 충족한 종목 중 상위 N개까지 선정합니다.",
+        )
         frequency_text = st.text_input(
             "리밸런싱 주기 목록",
-            value="monthly,quarterly",
+            value="quarterly",
             help="입력 가능: weekly, monthly, bimonthly, quarterly, semiannual, annual",
         )
         strategy_names = selected_strategy_names_from_checkboxes()
@@ -827,7 +817,7 @@ def main() -> None:
             min_value=0,
             max_value=30,
             value=30,
-            help="리밸런싱 날짜를 주기 말(월말 등)보다 몇 일 앞당길지 설정합니다. 비영업일일 경우 직전 영업일로 보정됩니다.",
+            help="주기의 마지막 뉴욕증시 거래일에서 달력 기준으로 앞당길 일수입니다. 휴장일이면 직전 거래일을 신호일로 사용합니다.",
         )
         force_refresh = st.checkbox("가격 캐시 강제 새로고침", value=False)
         run_clicked = st.button("백테스트 실행", use_container_width=True, type="primary")
@@ -850,7 +840,7 @@ def main() -> None:
             with st.spinner("백테스트를 실행 중입니다. 조합이 많으면 몇 분 정도 걸릴 수 있습니다."):
                 st.session_state["results"] = run_backtest(
                     start=start_value.isoformat(),
-                    end=end_value.isoformat() if end_enabled else None,
+                    end=end_value.isoformat(),
                     top_n_values=top_n_values,
                     rebalance_frequencies=rebalance_frequencies,
                     strategy_names=strategy_names,
@@ -919,22 +909,21 @@ def main() -> None:
     else:
         selected_row, selected_run = best_row, None
         view_results = materialize_selected_results(results, selected_row, selected_run)
+        if "target_weight" not in view_results["latest_recommendations"]:
+            st.warning("이 결과는 이전 계산 방식으로 저장되었습니다. 수정된 성과와 목표 비중은 백테스트를 다시 실행하면 표시됩니다.")
         st.info("현재는 저장된 결과만 불러온 상태라 최고 조합 기준만 볼 수 있습니다. 조합 선택은 앱에서 백테스트를 새로 실행하면 사용할 수 있습니다.")
 
-    from rebalance_lab.backtest import calculate_next_rebalance_date
     next_rebal_dates = None
     latest_mkt_date_str = str(view_results.get("latest_market_date", ""))
-    if latest_mkt_date_str:
-        try:
-            current_shift = rebalance_shift_days if 'rebalance_shift_days' in locals() else 7
-            next_rebal_dates = calculate_next_rebalance_date(
-                latest_market_date=pd.Timestamp(latest_mkt_date_str),
-                rebalance_frequency=str(selected_row["rebalance_frequency"]),
-                rebalance_shift_days=current_shift,
-                non_trading_day_adjustment="prior",
-            )
-        except Exception:
-            pass
+    if pd.notna(selected_row.get("next_signal_date")) and pd.notna(selected_row.get("next_effective_date")):
+        next_rebal_dates = (
+            pd.Timestamp(selected_row["next_signal_date"]),
+            pd.Timestamp(selected_row["next_effective_date"]),
+        )
+    elif view_results.get("backtester") is not None:
+        next_rebal_dates = view_results["backtester"].get_next_scheduled_rebalance()
+    else:
+        st.caption("이전 결과에는 실행 당시의 다음 일정이 저장되어 있지 않습니다. 백테스트를 실행하면 예정일이 표시됩니다.")
 
     render_metric_strip(
         selected_row,
@@ -1000,6 +989,9 @@ def main() -> None:
                 caption=f"마지막 실행일은 {last_trade_date} 입니다. 실제로 마지막 리밸런싱이 체결된 포트폴리오를 기준으로 계산합니다.",
                 key_suffix="actual",
             )
+            if "target_weight" not in view_results["latest_recommendations"]:
+                st.info("이전 결과에는 전략의 목표 비중이 없습니다. 백테스트를 다시 실행하면 추천 매수 계획을 계산합니다.")
+                return
             signal_holdings = build_signal_target_holdings(
                 view_results["latest_recommendations"],
                 top_n=int(selected_row["top_n"]),
@@ -1007,10 +999,10 @@ def main() -> None:
             render_buy_plan_section(
                 holdings_frame=signal_holdings,
                 budget=budget,
-                title="다음 리밸런싱 추천 신호 기준",
+                title="최신 종가 기준 전략 매수 계획",
                 caption=(
                     f"신호 기준일은 {signal_as_of} 종가입니다. "
-                    "다음 거래일 시가에 실행된다고 가정하기 전의 계획용 계산이며, 현재는 최신 종가를 기준 가격으로 사용합니다."
+                    "해당 종가로 계산한 전략 목표 비중을 사용하며, 다음 예정 신호일에는 선정 종목과 비중이 달라질 수 있습니다."
                 ),
                 key_suffix="recommended",
             )
@@ -1058,10 +1050,27 @@ def main() -> None:
                 "max_drawdown": "최대낙폭",
                 "avg_monthly_turnover": "평균회전율",
                 "rebalance_count": "리밸런싱횟수",
+                "rebalance_shift_days": "앞당김 일수",
+                "next_signal_date": "다음 신호일",
+                "next_effective_date": "다음 실행일",
             }
         )
         st.dataframe(summary_table, use_container_width=True, hide_index=True)
-        render_downloads()
+        render_downloads(view_results)
+
+
+def main() -> None:
+    st.set_page_config(page_title="퀀트 투자 연구소", page_icon="📈", layout="wide")
+    page = st.navigation(
+        [
+            st.Page(render_rebalance_lab, title="리밸런싱 연구실", default=True),
+            st.Page(lambda: render_asset_comparison(CACHE_DIR / "price_history.parquet"),
+                    title="종목 비교", url_path="compare"),
+            st.Page(render_contribution_simulator, title="적립식 시뮬레이터", url_path="simulator"),
+        ],
+        position="top",
+    )
+    page.run()
 
 
 if __name__ == "__main__":

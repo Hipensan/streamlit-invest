@@ -33,6 +33,12 @@ class PriceBundle:
     close_prices: pd.DataFrame
     volume_prices: pd.DataFrame
 
+    def in_period(self, start: str, end: str | None) -> PriceBundle:
+        # Daily bars follow the downloader's inclusive start and exclusive end.
+        last_day = pd.Timestamp(end) - pd.Timedelta(days=1) if end is not None else None
+        window = slice(start, last_day)
+        return PriceBundle(self.open_prices.loc[window], self.close_prices.loc[window], self.volume_prices.loc[window])
+
 
 def normalize_ticker(symbol: str) -> str:
     return symbol.strip().upper().replace(".", "-")
@@ -170,7 +176,7 @@ def _bundle_covers_request(bundle: PriceBundle, start: str, end: str | None) -> 
     if pd.isna(available_start) or available_start > requested_start + pd.Timedelta(days=7):
         return False
     if end is not None:
-        requested_end = pd.Timestamp(end).tz_localize(None)
+        requested_end = pd.Timestamp(end).tz_localize(None) - pd.offsets.BDay(1)
         available_end = bundle.close_prices.index.max()
         if pd.isna(available_end) or available_end < requested_end:
             return False
@@ -185,28 +191,31 @@ def load_or_refresh_price_cache(
     force_refresh: bool = False,
 ) -> PriceBundle:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    if cache_path.exists() and not force_refresh:
+    cached_bundle = None
+    download_start, download_end = start, end
+    if cache_path.exists():
         try:
-            cached = pd.read_parquet(cache_path)
-            bundle = _cache_frame_to_bundle(cached)
-            if bundle is not None and _bundle_covers_request(bundle, start=start, end=end):
-                return bundle
-        except Exception:
+            cached_bundle = _cache_frame_to_bundle(pd.read_parquet(cache_path))
+        except (OSError, ValueError):
             pass
+    if cached_bundle is not None and not cached_bundle.close_prices.empty:
+        if not force_refresh and _bundle_covers_request(cached_bundle, start=start, end=end):
+            return cached_bundle.in_period(start, end)
+        # Other tools share this file. Keep the existing date span when refreshing it.
+        dates = cached_bundle.close_prices.index
+        download_start = min(start, dates.min().date().isoformat())
+        if end is not None:
+            download_end = max(end, (dates.max() + pd.Timedelta(days=1)).date().isoformat())
     try:
-        bundle = download_price_history(tickers=tickers, start=start, end=end)
+        bundle = download_price_history(tickers=tickers, start=download_start, end=download_end)
+        if bundle.close_prices.empty:
+            raise ValueError("요청한 기간의 가격 데이터를 내려받지 못했습니다.")
         _bundle_to_cache_frame(bundle).to_parquet(cache_path)
-        return bundle
-    except Exception as e:
-        if cache_path.exists():
-            try:
-                cached = pd.read_parquet(cache_path)
-                bundle = _cache_frame_to_bundle(cached)
-                if bundle is not None:
-                    return bundle
-            except Exception:
-                pass
-        raise e
+        return bundle.in_period(start, end)
+    except Exception:
+        if cached_bundle is not None and not cached_bundle.close_prices.empty:
+            return cached_bundle.in_period(start, end)
+        raise
 
 
 def persist_universe_snapshot(snapshot: UniverseSnapshot, path: Path) -> None:
